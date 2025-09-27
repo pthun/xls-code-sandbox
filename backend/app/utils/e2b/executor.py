@@ -469,6 +469,7 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
                 pkg.strip() for pkg in payload.pip_packages if pkg.strip()
             )
             if requirements_content:
+                exit_error: str | None = None
                 _sandbox_write_text(sandbox, requirements_path, requirements_content)
                 try:
                     result = sandbox.commands.run(
