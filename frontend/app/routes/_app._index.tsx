@@ -1,6 +1,8 @@
 import { redirect } from "react-router";
 
 import { API_BASE_URL } from "../config";
+import { Button } from "../components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import type { Route } from "./+types/_app._index";
 
 type ToolSummary = {
@@ -23,6 +25,9 @@ export async function loader({}: Route.LoaderArgs) {
       throw redirect(`/tools/${tools[0].id}`);
     }
   } catch (error) {
+    if (error instanceof Response) {
+      throw error;
+    }
     console.warn("Unable to reach tool API", error);
   }
 
@@ -38,14 +43,30 @@ export function meta({}: Route.MetaArgs) {
 
 export default function ToolIndexRoute() {
   return (
-    <div className="mx-auto max-w-3xl space-y-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-10 text-slate-200 shadow-xl">
-      <h3 className="text-2xl font-semibold">Welcome to the Tool Workspace</h3>
-      <p className="text-sm text-slate-400">
-        There are no tools yet. Use the <span className="font-semibold text-indigo-200">New tool</span> button in the sidebar to create one.
-      </p>
-      <p className="text-sm text-slate-400">
-        After your tool exists you can upload CSV or Excel files on its project page to begin processing data.
-      </p>
+    <div className="mx-auto flex max-w-3xl flex-col gap-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>Welcome to the Tool Workspace</CardTitle>
+          <CardDescription>
+            Spin up your first analysis tool to start uploading CSV or Excel
+            files for processing.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4 text-sm text-slate-600">
+          <p>
+            Use the <span className="font-medium text-indigo-600">New tool</span>
+            button in the sidebar to create a workspace. Each tool keeps its
+            uploads separate so you can manage multiple datasets in parallel.
+          </p>
+          <p>
+            Once created, head to the tool page to upload your spreadsheets and
+            review the file history.
+          </p>
+          <Button className="mt-6" onClick={() => window.dispatchEvent(new CustomEvent("tool-create-requested"))}>
+            Create your first tool
+          </Button>
+        </CardContent>
+      </Card>
     </div>
   );
 }

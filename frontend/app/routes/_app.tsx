@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   NavLink,
   Outlet,
@@ -8,6 +8,8 @@ import {
 } from "react-router";
 
 import { API_BASE_URL } from "../config";
+import { Button } from "../components/ui/button";
+import { Separator } from "../components/ui/separator";
 import type { Route } from "./+types/_app";
 
 type ToolSummary = {
@@ -52,7 +54,7 @@ export default function AppLayout() {
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function handleCreateTool() {
+  const handleCreateTool = useCallback(async () => {
     try {
       setIsCreating(true);
       setError(null);
@@ -78,26 +80,37 @@ export default function AppLayout() {
     } finally {
       setIsCreating(false);
     }
-  }
+  }, [navigate, revalidator]);
+
+  useEffect(() => {
+    const handler = () => {
+      if (!isCreating) {
+        void handleCreateTool();
+      }
+    };
+    window.addEventListener("tool-create-requested", handler);
+    return () => window.removeEventListener("tool-create-requested", handler);
+  }, [handleCreateTool, isCreating]);
+
+  useEffect(() => {
+    const handler = () => revalidator.revalidate();
+    window.addEventListener("tool-data-updated", handler);
+    return () => window.removeEventListener("tool-data-updated", handler);
+  }, [revalidator]);
 
   return (
-    <div className="flex min-h-screen bg-slate-950 text-slate-100">
-      <aside className="flex w-72 shrink-0 flex-col border-r border-slate-800 bg-slate-900/60 px-6 py-8">
+    <div className="flex min-h-screen bg-slate-100 text-slate-900">
+      <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-white px-6 py-8">
         <div className="flex items-center justify-between gap-2">
-          <h1 className="text-lg font-semibold">Tools</h1>
-          <button
-            type="button"
-            className="rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-60"
-            onClick={handleCreateTool}
-            disabled={isCreating}
-          >
+          <h1 className="text-lg font-semibold text-slate-900">Tools</h1>
+          <Button onClick={handleCreateTool} disabled={isCreating}>
             {isCreating ? "Creating..." : "New tool"}
-          </button>
+          </Button>
         </div>
 
         <nav className="mt-6 flex-1 space-y-1 overflow-y-auto pr-1 text-sm">
           {tools.length === 0 ? (
-            <p className="rounded-lg border border-dashed border-slate-700 bg-slate-900/40 px-3 py-4 text-center text-xs text-slate-400">
+            <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-center text-xs text-slate-500">
               No tools yet. Create your first tool to get started.
             </p>
           ) : (
@@ -106,16 +119,18 @@ export default function AppLayout() {
                 key={tool.id}
                 to={`/tools/${tool.id}`}
                 className={({ isActive }) =>
-                  `block rounded-lg border px-3 py-2 transition ${
+                  `group flex items-center justify-between rounded-lg border px-3 py-2 transition ${
                     isActive
-                      ? "border-indigo-400 bg-indigo-500/20 text-white"
-                      : "border-transparent bg-slate-900/40 text-slate-300 hover:border-slate-700 hover:bg-slate-900/60"
+                      ? "border-indigo-300 bg-indigo-50 text-indigo-700"
+                      : "border-transparent bg-white text-slate-600 hover:border-slate-200 hover:bg-slate-50"
                   }`
                 }
               >
-                <div className="font-medium">{tool.name}</div>
-                <div className="text-[10px] uppercase tracking-wide text-slate-500">
-                  {new Date(tool.created_at).toLocaleString()}
+                <div className="flex flex-col">
+                  <span className="font-medium">{tool.name}</span>
+                  <span className="text-[10px] uppercase tracking-wide text-slate-400">
+                    {new Date(tool.created_at).toLocaleString()}
+                  </span>
                 </div>
               </NavLink>
             ))
@@ -123,25 +138,30 @@ export default function AppLayout() {
         </nav>
 
         {error && (
-          <p className="mt-4 rounded-lg border border-red-500/70 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+          <p className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">
             {error}
           </p>
         )}
         {loadError && (
-          <p className="mt-4 rounded-lg border border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <p className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-600">
             {loadError}
           </p>
         )}
+        <Separator className="mt-6" />
+        <p className="mt-4 text-[11px] leading-relaxed text-slate-500">
+          Rename or delete tools from their workspace pages. All uploads are
+          stored per tool and will be removed on deletion.
+        </p>
       </aside>
 
       <main className="flex flex-1 flex-col">
-        <header className="border-b border-slate-800 bg-slate-900/60 px-8 py-6">
-          <h2 className="text-xl font-semibold">Tool Workspace</h2>
-          <p className="text-sm text-slate-400">
+        <header className="border-b border-slate-200 bg-white px-8 py-6">
+          <h2 className="text-xl font-semibold text-slate-900">Tool Workspace</h2>
+          <p className="text-sm text-slate-500">
             Upload spreadsheets to configure your analysis tools.
           </p>
         </header>
-        <section className="flex-1 overflow-y-auto px-8 py-6">
+        <section className="flex-1 overflow-y-auto bg-slate-50 px-8 py-6">
           <Outlet />
         </section>
       </main>

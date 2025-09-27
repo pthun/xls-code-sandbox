@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Generator
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -57,6 +58,10 @@ class ToolFile(BaseModel):
 
 class ToolDetail(Tool):
     files: list[ToolFile] = Field(default_factory=list)
+
+
+class ToolUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
 
 
 def _iso(dt: datetime) -> str:
@@ -202,6 +207,60 @@ def create_tool(connection: sqlite3.Connection = Depends(get_db)) -> Tool:
     if row is None:
         raise HTTPException(status_code=500, detail="Failed to load created tool")
     return row_to_tool(row)
+
+
+@app.patch(
+    "/api/tools/{tool_id}",
+    response_model=Tool,
+    summary="Rename an existing tool",
+)
+def rename_tool(
+    tool_id: int,
+    payload: ToolUpdateRequest,
+    connection: sqlite3.Connection = Depends(get_db),
+) -> Tool:
+    new_name = payload.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Tool name cannot be empty")
+
+    result = connection.execute(
+        "UPDATE tools SET name = ? WHERE id = ?",
+        (new_name, tool_id),
+    )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    connection.commit()
+
+    row = connection.execute(
+        "SELECT id, name, created_at FROM tools WHERE id = ?",
+        (tool_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    return row_to_tool(row)
+
+
+@app.delete(
+    "/api/tools/{tool_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a tool and its uploaded files",
+)
+def delete_tool(tool_id: int, connection: sqlite3.Connection = Depends(get_db)) -> Response:
+    row = connection.execute(
+        "SELECT id FROM tools WHERE id = ?",
+        (tool_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    connection.execute("DELETE FROM tools WHERE id = ?", (tool_id,))
+    connection.commit()
+
+    tool_upload_dir = UPLOAD_ROOT / str(tool_id)
+    if tool_upload_dir.exists():
+        shutil.rmtree(tool_upload_dir, ignore_errors=True)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get(
