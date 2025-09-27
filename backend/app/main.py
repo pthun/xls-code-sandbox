@@ -5,21 +5,28 @@ import asyncio
 import json
 import shutil
 import sqlite3
+import urllib.parse
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generator, Literal, Sequence
+from typing import Any, Generator, Literal, Sequence
 from uuid import uuid4
 
 import dotenv
 
-from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .prompts.e2b_assistant import E2B_ASSISTANT_PROMPT
-from .utils.e2b import E2BTestRequest, E2BTestResponse, execute_e2b_test
+from .utils.e2b import (
+    E2BTestRequest,
+    E2BTestResponse,
+    PersistedFile,
+    SandboxExecutionResult,
+    execute_e2b_test,
+)
 from .utils.openai import RoleLiteral, call_openai_responses
 
 dotenv.load_dotenv()
@@ -28,6 +35,7 @@ dotenv.load_dotenv()
 INSTANCE_DIR = Path(__file__).resolve().parent.parent / "instance"
 DATABASE_PATH = INSTANCE_DIR / "tools.db"
 UPLOAD_ROOT = INSTANCE_DIR / "uploads"
+RUNS_ROOT = INSTANCE_DIR / "runs"
 ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
 
@@ -124,12 +132,173 @@ def _usage_from_tokens(
     )
 
 
+def _write_run_metadata(run_dir: Path, metadata: dict[str, Any]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = run_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+
+def _save_run_record(
+    *,
+    run_id: str,
+    created_at: str,
+    payload: E2BTestRequest,
+    response: E2BTestResponse,
+    run_dir: Path,
+    persisted_files: Sequence[PersistedFile],
+    logs_path: Path,
+) -> None:
+    params_json = json.dumps(payload.params)
+    pip_json = json.dumps(payload.pip_packages)
+    allow_internet = 1 if payload.allow_internet else 0
+    ok_value = None if response.ok is None else int(bool(response.ok))
+    error_text = response.error
+    logs_relative = str(logs_path.relative_to(run_dir))
+
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO e2b_runs (
+                id,
+                created_at,
+                code,
+                params,
+                pip_packages,
+                allow_internet,
+                ok,
+                error,
+                logs_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                created_at,
+                payload.code,
+                params_json,
+                pip_json,
+                allow_internet,
+                ok_value,
+                error_text,
+                logs_relative,
+            ),
+        )
+
+        connection.execute(
+            "DELETE FROM e2b_run_files WHERE run_id = ?",
+            (run_id,),
+        )
+
+        for file_record in persisted_files:
+            local_relative = str(file_record.local_path.relative_to(run_dir))
+            connection.execute(
+                """
+                INSERT INTO e2b_run_files (
+                    run_id,
+                    sandbox_path,
+                    local_path,
+                    size_bytes
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    file_record.sandbox_path,
+                    local_relative,
+                    file_record.size_bytes,
+                ),
+            )
+
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _finalize_run_record(
+    run_id: str,
+    payload: E2BTestRequest,
+    execution: SandboxExecutionResult,
+    created_at: datetime,
+) -> None:
+    run_dir = execution.run_dir or (RUNS_ROOT / run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    logs_path = execution.logs_path
+    if logs_path is None:
+        logs_path = run_dir / "logs.txt"
+        logs_path.write_text(
+            "\n".join(execution.response.logs),
+            encoding="utf-8",
+        )
+
+    metadata = {
+        "run_id": run_id,
+        "created_at": created_at.isoformat(),
+        "code": payload.code,
+        "params": payload.params,
+        "pip_packages": payload.pip_packages,
+        "allow_internet": payload.allow_internet,
+        "response": execution.response.model_dump(),
+    }
+    _write_run_metadata(run_dir, metadata)
+
+    _save_run_record(
+        run_id=run_id,
+        created_at=_iso(created_at),
+        payload=payload,
+        response=execution.response,
+        run_dir=run_dir,
+        persisted_files=execution.persisted_files,
+        logs_path=logs_path,
+    )
+
+
+def _execute_run(
+    payload: E2BTestRequest,
+    *,
+    run_id: str,
+    log_sink=None,
+) -> SandboxExecutionResult:
+    execution = execute_e2b_test(
+        payload,
+        log_sink=log_sink,
+        run_id=run_id,
+        persist_root=RUNS_ROOT,
+    )
+    if execution.response.run_id is None:
+        execution.response.run_id = run_id
+    return execution
+
+class RunFileResponse(BaseModel):
+    sandbox_path: str
+    local_path: str
+    size_bytes: int
+    download_url: str
+
+
+class RunSummaryResponse(BaseModel):
+    id: str
+    created_at: datetime
+    ok: bool | None
+    error: str | None
+
+
+class RunDetailResponse(RunSummaryResponse):
+    code: str
+    params: dict[str, Any]
+    pip_packages: list[str]
+    allow_internet: bool
+    logs: list[str]
+    files: list[RunFileResponse]
+
+
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
 def init_storage() -> None:
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def init_db() -> None:
@@ -152,6 +321,26 @@ def init_db() -> None:
                 content_type TEXT,
                 size_bytes INTEGER NOT NULL,
                 uploaded_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS e2b_runs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                code TEXT NOT NULL,
+                params TEXT NOT NULL,
+                pip_packages TEXT NOT NULL,
+                allow_internet INTEGER NOT NULL,
+                ok INTEGER,
+                error TEXT,
+                logs_path TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS e2b_run_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES e2b_runs(id) ON DELETE CASCADE,
+                sandbox_path TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL
             );
             """
         )
@@ -251,7 +440,11 @@ def double_number(payload: DoubleRequest) -> DoubleResponse:
 def run_e2b_test(payload: E2BTestRequest) -> E2BTestResponse:
     """Create a fresh E2B sandbox, seed the runner scaffolding, and execute the provided code."""
 
-    return execute_e2b_test(payload)
+    run_id = uuid4().hex
+    created_at = datetime.now(timezone.utc)
+    execution = _execute_run(payload, run_id=run_id)
+    _finalize_run_record(run_id, payload, execution, created_at)
+    return execution.response
 
 
 @app.post(
@@ -327,6 +520,8 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[str] = asyncio.Queue()
+    run_id = uuid4().hex
+    created_at = datetime.now(timezone.utc)
 
     def _enqueue(event: dict[str, object]) -> None:
         message = json.dumps(event, ensure_ascii=False)
@@ -338,8 +533,10 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
 
     def _worker() -> None:
         try:
-            result = execute_e2b_test(payload, log_sink=_log_sink)
+            execution = _execute_run(payload, run_id=run_id, log_sink=_log_sink)
+            result = execution.response
             _enqueue({"type": "result", "data": result.model_dump()})
+            _finalize_run_record(run_id, payload, execution, created_at)
         except HTTPException as http_exc:  # propagate structured error
             _enqueue({"type": "error", "status": http_exc.status_code, "detail": http_exc.detail})
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -362,6 +559,147 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
 
     return StreamingResponse(_event_stream(), media_type="application/jsonlines")
 
+
+@app.get("/api/e2b-runs", response_model=list[RunSummaryResponse], summary="List sandbox runs")
+def list_e2b_runs(connection: sqlite3.Connection = Depends(get_db)) -> list[RunSummaryResponse]:
+    rows = connection.execute(
+        "SELECT id, created_at, ok, error FROM e2b_runs ORDER BY created_at DESC"
+    ).fetchall()
+
+    summaries: list[RunSummaryResponse] = []
+    for row in rows:
+        created_at = datetime.fromisoformat(row["created_at"])
+        ok_value = row["ok"]
+        ok_bool = None if ok_value is None else bool(ok_value)
+        summaries.append(
+            RunSummaryResponse(
+                id=row["id"],
+                created_at=created_at,
+                ok=ok_bool,
+                error=row["error"],
+            )
+        )
+    return summaries
+
+
+@app.get(
+    "/api/e2b-runs/{run_id}",
+    response_model=RunDetailResponse,
+    summary="Fetch sandbox run details",
+)
+def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -> RunDetailResponse:
+    run_row = connection.execute(
+        """
+        SELECT id, created_at, code, params, pip_packages, allow_internet, ok, error, logs_path
+        FROM e2b_runs
+        WHERE id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+
+    if run_row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    created_at = datetime.fromisoformat(run_row["created_at"])
+    params = json.loads(run_row["params"])
+    pip_packages = json.loads(run_row["pip_packages"])
+    allow_internet = bool(run_row["allow_internet"])
+    ok_value = run_row["ok"]
+    ok_bool = None if ok_value is None else bool(ok_value)
+    error_text = run_row["error"]
+
+    run_dir = RUNS_ROOT / run_id
+    logs_relative = run_row["logs_path"] or "logs.txt"
+    logs_file = _resolve_run_file(run_dir, logs_relative)
+    logs: list[str] = []
+    if logs_file.exists():
+        logs = logs_file.read_text(encoding="utf-8").splitlines()
+
+    files_rows = connection.execute(
+        """
+        SELECT sandbox_path, local_path, size_bytes
+        FROM e2b_run_files
+        WHERE run_id = ?
+        ORDER BY sandbox_path
+        """,
+        (run_id,),
+    ).fetchall()
+
+    files: list[RunFileResponse] = []
+    for file_row in files_rows:
+        local_path = file_row["local_path"]
+        download_url = (
+            f"/api/e2b-runs/{run_id}/file?path="
+            f"{urllib.parse.quote(local_path, safe='')}"
+        )
+        files.append(
+            RunFileResponse(
+                sandbox_path=file_row["sandbox_path"],
+                local_path=local_path,
+                size_bytes=file_row["size_bytes"],
+                download_url=download_url,
+            )
+        )
+
+    return RunDetailResponse(
+        id=run_row["id"],
+        created_at=created_at,
+        ok=ok_bool,
+        error=error_text,
+        code=run_row["code"],
+        params=params,
+        pip_packages=pip_packages,
+        allow_internet=allow_internet,
+        logs=logs,
+        files=files,
+    )
+
+
+@app.get(
+    "/api/e2b-runs/{run_id}/file",
+    summary="Download a file generated by a sandbox run",
+)
+def download_e2b_run_file(run_id: str, path: str = Query(..., description="Relative file path")) -> FileResponse:
+    run_dir = RUNS_ROOT / run_id
+    target = _resolve_run_file(run_dir, path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(target)
+
+
+@app.delete(
+    "/api/e2b-runs/{run_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a sandbox run",
+)
+def delete_e2b_run(run_id: str) -> Response:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        cursor = connection.execute(
+            "DELETE FROM e2b_runs WHERE id = ?",
+            (run_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    run_dir = RUNS_ROOT / run_id
+    if run_dir.exists():
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _resolve_run_file(run_dir: Path, relative_path: str) -> Path:
+    target = (run_dir / relative_path).resolve()
+    run_dir_resolved = run_dir.resolve()
+    if not str(target).startswith(str(run_dir_resolved)):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+    return target
 
 @app.get("/api/tools", response_model=list[Tool], summary="List available tools")
 def list_tools(connection: sqlite3.Connection = Depends(get_db)) -> list[Tool]:

@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from contextlib import suppress
 from string import Template
-from typing import Any, Callable, Dict, Iterable, Protocol
+from typing import Any, Callable, Dict, Iterable, Mapping, Protocol
 from uuid import uuid4
 
 from e2b import CommandExitException, FileType
@@ -17,6 +19,22 @@ from .models import E2BFileInfo, E2BTestRequest, E2BTestResponse
 class HostAction(Protocol):
     def __call__(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         ...
+
+
+@dataclass
+class PersistedFile:
+    sandbox_path: str
+    local_path: Path
+    size_bytes: int
+
+
+@dataclass
+class SandboxExecutionResult:
+    response: E2BTestResponse
+    persisted_files: list[PersistedFile]
+    logs_path: Path | None
+    run_dir: Path | None
+
 
 E2B_APP_DIR = "/app"
 E2B_SDK_DIR = f"{E2B_APP_DIR}/sdk"
@@ -392,8 +410,14 @@ def _collect_file_info(sandbox: Sandbox, roots: Iterable[str]) -> list[E2BFileIn
 LogSink = Callable[[list[str]], None]
 
 
-def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None) -> E2BTestResponse:
-    """Spin up a sandbox, run the supplied code, and return logs plus artifacts."""
+def execute_e2b_test(
+    payload: E2BTestRequest,
+    *,
+    log_sink: LogSink | None = None,
+    run_id: str | None = None,
+    persist_root: Path | None = None,
+) -> SandboxExecutionResult:
+    """Spin up a sandbox, run the supplied code, and optionally persist artefacts."""
 
     sandbox = _create_sandbox(payload.allow_internet)
     host_actions: Dict[str, HostAction] = {
@@ -408,6 +432,13 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
     }
     stdout_lines: list[str] = []
     log_lines: list[str] = []
+    persisted_files: list[PersistedFile] = []
+    logs_path: Path | None = None
+    run_dir: Path | None = None
+
+    if run_id and persist_root:
+        run_dir = persist_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
     def _emit(lines: list[str]) -> None:
         if log_sink and lines:
@@ -488,12 +519,26 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
                 if exit_error is not None:
                     _read_log_updates()
                     files = _collect_file_info(sandbox, [E2B_ARTIFACT_DIR, E2B_IO_DIR])
-                    return E2BTestResponse(
+                    combined_logs = log_lines + [
+                        line for line in stdout_lines if line not in log_lines
+                    ]
+                    if run_dir:
+                        persisted_files, logs_path = _finalize_persistence(
+                            sandbox, run_dir, files, combined_logs
+                        )
+                    response = E2BTestResponse(
+                        run_id=run_id,
                         ok=False,
                         sandbox_id=getattr(sandbox, "sandbox_id", "unknown"),
-                        logs=log_lines + stdout_lines,
+                        logs=combined_logs,
                         files=files,
                         error=exit_error,
+                    )
+                    return SandboxExecutionResult(
+                        response=response,
+                        persisted_files=persisted_files,
+                        logs_path=logs_path,
+                        run_dir=run_dir,
                     )
 
         command_handle = sandbox.commands.run(
@@ -560,14 +605,55 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
         if exit_error is None and exit_code not in (None, 0):
             exit_error = f"Sandbox process exited with code {exit_code}"
 
-        return E2BTestResponse(
+        if run_dir:
+            persisted_files, logs_path = _finalize_persistence(
+                sandbox, run_dir, files, log_lines
+            )
+
+        response = E2BTestResponse(
+            run_id=run_id,
             ok=exit_error is None,
             sandbox_id=sandbox_id,
             logs=log_lines,
             files=files,
             error=exit_error,
         )
+        return SandboxExecutionResult(
+            response=response,
+            persisted_files=persisted_files,
+            logs_path=logs_path,
+            run_dir=run_dir,
+        )
     finally:
         if hasattr(sandbox, "close"):
             with suppress(Exception):
                 sandbox.kill()
+
+
+def _finalize_persistence(
+    sandbox: Sandbox,
+    run_dir: Path,
+    files: list[E2BFileInfo],
+    logs: list[str],
+) -> tuple[list[PersistedFile], Path]:
+    persisted: list[PersistedFile] = []
+    for file_info in files:
+        sandbox_path = file_info.path
+        relative = Path(sandbox_path.lstrip("/"))
+        target = run_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = _sandbox_read_bytes(sandbox, sandbox_path)
+        target.write_bytes(data)
+        persisted.append(
+            PersistedFile(
+                sandbox_path=sandbox_path,
+                local_path=target,
+                size_bytes=file_info.size_bytes,
+            )
+        )
+
+    logs_path = run_dir / "logs.txt"
+    logs_path.parent.mkdir(parents=True, exist_ok=True)
+    logs_path.write_text("\n".join(logs), encoding="utf-8")
+
+    return persisted, logs_path

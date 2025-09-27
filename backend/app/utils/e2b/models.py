@@ -34,6 +34,7 @@ class E2BFileInfo(BaseModel):
 class E2BTestResponse(BaseModel):
     """Structured response returned after sandbox execution."""
 
+    run_id: str | None = None
     ok: bool
     sandbox_id: str
     logs: list[str]
