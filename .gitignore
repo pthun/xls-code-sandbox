@@ -16,3 +16,6 @@ ENV/
 .env*
 *.env
 *.env*
+
+# Python cache files
+.pycache
