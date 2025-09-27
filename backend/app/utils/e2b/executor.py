@@ -45,6 +45,8 @@ from typing import Any, Dict
 CONF_PATH = "${CONF_PATH}"
 LOG_FILE = "${LOG_FILE}"
 IO_DIR = "${IO_DIR}"
+INPUT_DIR = "${INPUT_DIR}"
+ARTIFACT_DIR = "${ARTIFACT_DIR}"
 
 
 def _log(message: str) -> None:
@@ -63,7 +65,15 @@ def _load_module(entry_path: str):
     return module
 
 
-def _build_ctx(call_host, async_call_host, sdk_log, read_inputs, write_outputs):
+def _build_ctx(
+    call_host,
+    async_call_host,
+    sdk_log,
+    read_inputs,
+    write_outputs,
+    list_input_files,
+    list_output_files,
+):
     return SimpleNamespace(
         rpc_call=call_host,
         rpc_call_async=async_call_host,
@@ -71,6 +81,10 @@ def _build_ctx(call_host, async_call_host, sdk_log, read_inputs, write_outputs):
         read_inputs=read_inputs,
         write_outputs=write_outputs,
         io_dir=IO_DIR,
+        input_dir=INPUT_DIR,
+        output_dir=ARTIFACT_DIR,
+        list_input_files=list_input_files,
+        list_output_files=list_output_files,
     )
 
 
@@ -84,10 +98,23 @@ def main() -> None:
     _log(f"[runner] launching {entry_path}")
 
     from sdk.rpc import call_host, async_call_host
-    from sdk.io import read_inputs, write_outputs
+    from sdk.io import (
+        list_input_files,
+        list_output_files,
+        read_inputs,
+        write_outputs,
+    )
     from sdk.log import log as sdk_log
 
-    ctx = _build_ctx(call_host, async_call_host, sdk_log, read_inputs, write_outputs)
+    ctx = _build_ctx(
+        call_host,
+        async_call_host,
+        sdk_log,
+        read_inputs,
+        write_outputs,
+        list_input_files,
+        list_output_files,
+    )
 
     module = _load_module(entry_path)
     if not hasattr(module, "run"):
@@ -108,6 +135,8 @@ if __name__ == "__main__":
     CONF_PATH=E2B_CONFIG_PATH,
     LOG_FILE=E2B_LOG_FILE,
     IO_DIR=E2B_IO_DIR,
+    INPUT_DIR=E2B_INPUT_DIR,
+    ARTIFACT_DIR=E2B_ARTIFACT_DIR,
 )
 
 
@@ -221,6 +250,14 @@ def write_outputs(**artifacts):
             json.dump(value, handle, ensure_ascii=False, indent=2)
         stored[name] = str(target)
     return stored
+ 
+ 
+def list_input_files(pattern: str = "*"):
+    return [str(path) for path in Path(INPUT_DIR).glob(pattern)]
+ 
+ 
+def list_output_files(pattern: str = "*"):
+    return [str(path) for path in Path(ARTIFACT_DIR).glob(pattern)]
 """
 ).substitute(
     IO_DIR=E2B_IO_DIR,
