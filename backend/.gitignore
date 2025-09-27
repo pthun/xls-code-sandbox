@@ -54,6 +54,8 @@ ENV/
 env/
 venv.bak/
 .env.bak/
+.env.*
+!.env.example
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -70,3 +72,6 @@ __pypackages__/
 # Local settings
 local_settings.py
 secret.py
+
+# Instance folder
+instance/

@@ -12,10 +12,12 @@ from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile,
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from .utils.e2b import E2BTestRequest, E2BTestResponse, execute_e2b_test
 
-DATA_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = DATA_DIR / "tools.db"
-UPLOAD_ROOT = DATA_DIR / "uploads"
+
+INSTANCE_DIR = Path(__file__).resolve().parent.parent / "instance"
+DATABASE_PATH = INSTANCE_DIR / "tools.db"
+UPLOAD_ROOT = INSTANCE_DIR / "uploads"
 ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
 
@@ -183,6 +185,17 @@ def double_number(payload: DoubleRequest) -> DoubleResponse:
     )
 
 
+@app.post(
+    "/api/e2b-test",
+    response_model=E2BTestResponse,
+    summary="Execute AI-authored Python inside an E2B sandbox",
+)
+def run_e2b_test(payload: E2BTestRequest) -> E2BTestResponse:
+    """Create a fresh E2B sandbox, seed the runner scaffolding, and execute the provided code."""
+
+    return execute_e2b_test(payload)
+
+
 @app.get("/api/tools", response_model=list[Tool], summary="List available tools")
 def list_tools(connection: sqlite3.Connection = Depends(get_db)) -> list[Tool]:
     rows = connection.execute(
@@ -194,9 +207,24 @@ def list_tools(connection: sqlite3.Connection = Depends(get_db)) -> list[Tool]:
 @app.post("/api/tools", response_model=Tool, summary="Create a new tool")
 def create_tool(connection: sqlite3.Connection = Depends(get_db)) -> Tool:
     created_at = _iso(datetime.now(timezone.utc))
+
+    # Generate a unique default name using the "New Tool (x)" convention
+    existing_names = {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM tools WHERE name LIKE 'New Tool (%)'"
+        ).fetchall()
+    }
+    suffix = 1
+    while True:
+        candidate = f"New Tool ({suffix})"
+        if candidate not in existing_names:
+            break
+        suffix += 1
+
     cursor = connection.execute(
         "INSERT INTO tools (name, created_at) VALUES (?, ?)",
-        ("Untitled tool", created_at),
+        (candidate, created_at),
     )
     connection.commit()
     tool_id = cursor.lastrowid
