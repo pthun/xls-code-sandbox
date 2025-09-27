@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import dotenv
+dotenv.load_dotenv()
+
 import shutil
 import sqlite3
-from contextlib import asynccontextmanager
+import asyncio
+import json
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator
@@ -10,6 +15,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .utils.e2b import E2BTestRequest, E2BTestResponse, execute_e2b_test
@@ -194,6 +200,51 @@ def run_e2b_test(payload: E2BTestRequest) -> E2BTestResponse:
     """Create a fresh E2B sandbox, seed the runner scaffolding, and execute the provided code."""
 
     return execute_e2b_test(payload)
+
+
+@app.post(
+    "/api/e2b-test/stream",
+    summary="Stream E2B sandbox execution logs in real time",
+)
+async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
+    """Start a sandbox run and emit newline-delimited JSON events as it progresses."""
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def _enqueue(event: dict[str, object]) -> None:
+        message = json.dumps(event, ensure_ascii=False)
+        loop.call_soon_threadsafe(queue.put_nowait, message)
+
+    def _log_sink(lines: list[str]) -> None:
+        if lines:
+            _enqueue({"type": "log", "lines": lines})
+
+    def _worker() -> None:
+        try:
+            result = execute_e2b_test(payload, log_sink=_log_sink)
+            _enqueue({"type": "result", "data": result.model_dump()})
+        except HTTPException as http_exc:  # propagate structured error
+            _enqueue({"type": "error", "status": http_exc.status_code, "detail": http_exc.detail})
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _enqueue({"type": "error", "status": 500, "detail": str(exc)})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, "__EOF__")
+
+    worker_future = loop.run_in_executor(None, _worker)
+
+    async def _event_stream():
+        try:
+            while True:
+                item = await queue.get()
+                if item == "__EOF__":
+                    break
+                yield item + "\n"
+        finally:
+            with suppress(Exception):
+                await worker_future
+
+    return StreamingResponse(_event_stream(), media_type="application/jsonlines")
 
 
 @app.get("/api/tools", response_model=list[Tool], summary="List available tools")

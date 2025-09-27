@@ -37,6 +37,7 @@ const DEFAULT_PARAMS = `{
 }`;
 
 type SandboxRunResult = {
+  ok: boolean;
   sandboxId: string;
   logs: string[];
   files: {
@@ -44,9 +45,11 @@ type SandboxRunResult = {
     sizeBytes: number;
     preview: string | null;
   }[];
+  error: string | null;
 };
 
 type SandboxApiResponse = {
+  ok: boolean;
   sandbox_id: string;
   logs: string[];
   files: {
@@ -54,6 +57,7 @@ type SandboxApiResponse = {
     size_bytes: number;
     preview: string | null;
   }[];
+  error?: string | null;
 };
 
 export function meta({}: Route.MetaArgs) {
@@ -73,6 +77,7 @@ export default function E2BTestRoute() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SandboxRunResult | null>(null);
+  const [logs, setLogs] = useState<string[]>([]);
   const isBusy = isRunning;
 
   const handleSubmit = useCallback(
@@ -84,12 +89,14 @@ export default function E2BTestRoute() {
 
       setError(null);
       setIsRunning(true);
+      setResult(null);
+      setLogs([]);
 
       try {
         const trimmed = paramsText.trim();
         const parsedParams = trimmed ? JSON.parse(trimmed) : {};
 
-        const response = await fetch(`${API_BASE_URL}/api/e2b-test`, {
+        const response = await fetch(`${API_BASE_URL}/api/e2b-test/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -114,17 +121,84 @@ export default function E2BTestRoute() {
           throw new Error(message || `Sandbox request failed (${response.status})`);
         }
 
-        const payload = (await response.json()) as SandboxApiResponse;
-        setResult({
-          sandboxId: payload.sandbox_id,
-          logs: payload.logs ?? [],
-          files:
-            payload.files?.map((file) => ({
-              path: file.path,
-              sizeBytes: file.size_bytes,
-              preview: file.preview ?? null,
-            })) ?? [],
-        });
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error("Streaming not supported by this browser.");
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        const processLine = (line: string) => {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) {
+            return;
+          }
+
+          const event = JSON.parse(trimmedLine) as {
+            type: "log" | "result" | "error";
+            lines?: string[];
+            data?: SandboxApiResponse;
+            detail?: unknown;
+            message?: string;
+          };
+
+          if (event.type === "log" && Array.isArray(event.lines)) {
+            setLogs((prev) => [...prev, ...event.lines!]);
+            return;
+          }
+
+          if (event.type === "result" && event.data) {
+            const payload = event.data;
+            const normalized: SandboxRunResult = {
+              ok: payload.ok ?? true,
+              sandboxId: payload.sandbox_id,
+              logs: payload.logs ?? [],
+              files:
+                payload.files?.map((file) => ({
+                  path: file.path,
+                  sizeBytes: file.size_bytes,
+                  preview: file.preview ?? null,
+                })) ?? [],
+              error:
+                typeof payload.error === "string" && payload.error.length > 0
+                  ? payload.error
+                  : null,
+            };
+            setResult(normalized);
+            setLogs(normalized.logs);
+            setIsRunning(false);
+            return;
+          }
+
+          if (event.type === "error") {
+            const detailText =
+              typeof event.detail === "string"
+                ? event.detail
+                : event.message || "Sandbox run failed.";
+            setError(detailText);
+            setIsRunning(false);
+          }
+        };
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          let newlineIndex: number;
+          while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, newlineIndex);
+            buffer = buffer.slice(newlineIndex + 1);
+            processLine(line);
+          }
+        }
+
+        const leftover = buffer + decoder.decode();
+        if (leftover.trim().length > 0) {
+          processLine(leftover);
+        }
       } catch (submissionError) {
         if (submissionError instanceof SyntaxError) {
           setError("Params must be valid JSON.");
@@ -217,22 +291,44 @@ export default function E2BTestRoute() {
         </div>
       )}
 
-      {result && (
+      {(result || logs.length > 0 || error) && (
         <Card>
           <CardHeader className="flex flex-col gap-1">
             <CardTitle>Sandbox result</CardTitle>
-            <CardDescription>Sandbox ID: {result.sandboxId}</CardDescription>
+            {result ? (
+              <CardDescription>
+                Sandbox ID: {result.sandboxId}
+                {!result.ok && result.error ? ` — ${result.error}` : null}
+              </CardDescription>
+            ) : (
+              <CardDescription>Streaming sandbox output…</CardDescription>
+            )}
           </CardHeader>
           <CardContent className="space-y-6">
+            {result && (
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span>Status:</span>
+                <span className={result.ok ? "text-emerald-600" : "text-destructive"}>
+                  {result.ok ? "Completed" : "Failed"}
+                </span>
+              </div>
+            )}
+
+            {result && !result.ok && result.error && (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                Sandbox process reported an error: {result.error}
+              </div>
+            )}
+
             <section className="space-y-3">
               <h3 className="text-sm font-semibold">Execution logs</h3>
-              {result.logs.length === 0 ? (
+              {logs.length === 0 ? (
                 <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                  No log lines were produced.
+                  No log lines yet.
                 </p>
               ) : (
                 <pre className="max-h-[320px] overflow-y-auto rounded-md border border-border bg-muted/40 p-3 text-xs">
-                  {result.logs.join("\n")}
+                  {logs.join("\n")}
                 </pre>
               )}
             </section>
@@ -241,31 +337,37 @@ export default function E2BTestRoute() {
 
             <section className="space-y-3">
               <h3 className="text-sm font-semibold">Artifacts & Files</h3>
-              {artifactGroups.length === 0 ? (
-                <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                  No files were produced during this run.
-                </p>
+              {result ? (
+                artifactGroups.length === 0 ? (
+                  <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                    No files were produced during this run.
+                  </p>
+                ) : (
+                  <ul className="space-y-3 text-xs">
+                    {artifactGroups.map((file) => (
+                      <li
+                        key={file.path}
+                        className="rounded-md border border-border bg-muted/30 p-3"
+                      >
+                        <div className="flex items-center justify-between gap-4 text-[11px] uppercase tracking-wide text-muted-foreground">
+                          <span className="truncate font-medium normal-case text-foreground">
+                            {file.path}
+                          </span>
+                          <span>{formatSize(file.sizeBytes)}</span>
+                        </div>
+                        {file.preview && (
+                          <pre className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded bg-background/80 p-2 text-[11px]">
+                            {file.preview}
+                          </pre>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )
               ) : (
-                <ul className="space-y-3 text-xs">
-                  {artifactGroups.map((file) => (
-                    <li
-                      key={file.path}
-                      className="rounded-md border border-border bg-muted/30 p-3"
-                    >
-                      <div className="flex items-center justify-between gap-4 text-[11px] uppercase tracking-wide text-muted-foreground">
-                        <span className="truncate font-medium normal-case text-foreground">
-                          {file.path}
-                        </span>
-                        <span>{formatSize(file.sizeBytes)}</span>
-                      </div>
-                      {file.preview && (
-                        <pre className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded bg-background/80 p-2 text-[11px]">
-                          {file.preview}
-                        </pre>
-                      )}
-                    </li>
-                  ))}
-                </ul>
+                <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                  Waiting for sandbox completion before listing files.
+                </p>
               )}
             </section>
           </CardContent>
