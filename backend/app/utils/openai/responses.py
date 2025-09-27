@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
-from typing import List, Literal, Sequence
+from typing import List, Literal, Sequence, Any
 
 from openai import OpenAI
 from openai.types.responses import (
@@ -14,7 +15,7 @@ from openai.types.responses import (
     ResponseUsage,
 )
 from openai.types.responses.easy_input_message_param import EasyInputMessageParam
-
+from ..misc.typeguards import is_any_list
 
 RoleLiteral = Literal["user", "assistant", "system", "developer"]
 
@@ -30,6 +31,10 @@ def call_openai_responses(
     str,
     str | None,
     list[str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    bool,
+    bool,
     int | None,
     int | None,
     int | None,
@@ -54,10 +59,16 @@ def call_openai_responses(
     raw_text = _extract_text(response)
     code_blocks = _extract_tagged_blocks(raw_text, "CodeOutput")
     pip_blocks = _extract_tagged_blocks(raw_text, "Pip")
+    params_blocks = _extract_tagged_blocks(raw_text, "Params")
+    file_blocks = _extract_tagged_blocks(raw_text, "FileList")
 
     code = code_blocks[-1] if code_blocks else None
     pip_packages = _split_packages(pip_blocks)
-    display_text = _strip_tags(raw_text, ("CodeOutput", "Pip"))
+    params_present = bool(params_blocks)
+    file_present = bool(file_blocks)
+    params_model = _parse_json_array(params_blocks[-1] if params_blocks else None)
+    file_requirements = _parse_json_array(file_blocks[-1] if file_blocks else None)
+    display_text = _strip_tags(raw_text, ("CodeOutput", "Pip", "Params", "FileList"))
 
     usage: ResponseUsage | None = response.usage
     prompt_tokens = usage.input_tokens if usage else None
@@ -69,6 +80,10 @@ def call_openai_responses(
         display_text,
         code,
         pip_packages,
+        params_model,
+        file_requirements,
+        params_present,
+        file_present,
         prompt_tokens,
         completion_tokens,
         total_tokens,
@@ -126,6 +141,18 @@ def _split_packages(blocks: Sequence[str]) -> list[str]:
             if pkg:
                 packages.append(pkg)
     return packages
+
+
+def _parse_json_array(block: str | None) -> list[dict[str, Any]]:
+    if not block:
+        return []
+    try:
+        data = json.loads(block)
+    except json.JSONDecodeError:
+        return []
+    if is_any_list(data):
+        return [item for item in data if isinstance(item, dict)]
+    return []
 
 
 def _strip_tags(text: str, tags: Sequence[str]) -> str:

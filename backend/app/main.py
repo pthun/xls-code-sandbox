@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import os
 import asyncio
+import csv
+import io
 import json
+import logging
+import os
 import shutil
 import sqlite3
 import urllib.parse
@@ -17,7 +20,7 @@ import dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .prompts.e2b_assistant import E2B_ASSISTANT_PROMPT
 from .utils.e2b import (
@@ -37,6 +40,9 @@ DATABASE_PATH = INSTANCE_DIR / "tools.db"
 UPLOAD_ROOT = INSTANCE_DIR / "uploads"
 RUNS_ROOT = INSTANCE_DIR / "runs"
 ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
+
+
+logger = logging.getLogger(__name__)
 
 
 class DoubleRequest(BaseModel):
@@ -116,6 +122,9 @@ class ChatCompletionResponse(BaseModel):
     pip_packages: list[str] = Field(default_factory=list)
     usage: ChatUsage | None = None
     raw: str | None = None
+    version: int | None = None
+    params: list[dict[str, Any]] = Field(default_factory=list)
+    required_files: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def _usage_from_tokens(
@@ -132,6 +141,429 @@ def _usage_from_tokens(
     )
 
 
+def _ensure_initial_code_version() -> None:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        row = connection.execute("SELECT COUNT(*) AS count FROM code_versions").fetchone()
+        if row and row["count"] == 0:
+            now = datetime.now(timezone.utc)
+            connection.execute(
+                """
+                INSERT INTO code_versions (
+                    created_at,
+                    author,
+                    note,
+                    code,
+                    pip_packages,
+                    origin_run_id,
+                    params_model,
+                    required_files
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _iso(now),
+                    "system",
+                    "Initial version",
+                    DEFAULT_CODE,
+                    json.dumps(DEFAULT_PIP_PACKAGES),
+                    None,
+                    json.dumps([]),
+                    json.dumps([]),
+                ),
+            )
+            connection.commit()
+    finally:
+        connection.close()
+
+
+def _parse_param_specs(value: str | None) -> list[ParamSpec]:
+    if not value:
+        return []
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+
+    specs: list[ParamSpec] = []
+    if isinstance(raw, list):
+        for item in raw:
+            try:
+                specs.append(ParamSpec.model_validate(item))
+            except ValidationError:
+                continue
+    return specs
+
+
+def _parse_file_requirements(value: str | None) -> list[FileRequirement]:
+    if not value:
+        return []
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+
+    files: list[FileRequirement] = []
+    if isinstance(raw, list):
+        for item in raw:
+            try:
+                files.append(FileRequirement.model_validate(item))
+            except ValidationError:
+                continue
+    return files
+
+
+def _coerce_param_specs(items: Sequence[dict[str, Any]]) -> list[ParamSpec]:
+    specs: list[ParamSpec] = []
+    for item in items:
+        try:
+            specs.append(ParamSpec.model_validate(item))
+        except ValidationError:
+            continue
+    return specs
+
+
+def _coerce_file_requirements(items: Sequence[dict[str, Any]]) -> list[FileRequirement]:
+    files: list[FileRequirement] = []
+    for item in items:
+        try:
+            files.append(FileRequirement.model_validate(item))
+        except ValidationError:
+            continue
+    return files
+
+
+def _params_to_dicts(items: Sequence[ParamSpec]) -> list[dict[str, Any]]:
+    return [item.model_dump() for item in items]
+
+
+def _files_to_dicts(items: Sequence[FileRequirement]) -> list[dict[str, Any]]:
+    return [item.model_dump() for item in items]
+
+
+def _param_matches_type(value: Any, expected: str) -> bool:
+    normalized = expected.strip().lower()
+    if normalized in {"string", "str"}:
+        return isinstance(value, str)
+    if normalized in {"integer", "int"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if normalized in {"number", "float"}:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if normalized in {"boolean", "bool"}:
+        return isinstance(value, bool)
+    if normalized in {"object", "dict"}:
+        return isinstance(value, dict)
+    if normalized in {"array", "list"}:
+        return isinstance(value, list)
+    return True
+
+
+def _glob_required_files(pattern: str) -> list[Path]:
+    if not pattern:
+        return []
+    candidate = Path(pattern)
+    if candidate.is_absolute():
+        return [candidate] if candidate.exists() else []
+    if not UPLOAD_ROOT.exists():
+        return []
+    if "/" in pattern or pattern.startswith("**"):
+        return list(UPLOAD_ROOT.glob(pattern))
+    return list(UPLOAD_ROOT.rglob(pattern))
+
+
+def _validate_run_inputs(payload: E2BTestRequest, detail: CodeVersionDetail) -> None:
+    params = payload.params or {}
+    missing_params: list[str] = []
+    invalid_params: list[dict[str, str]] = []
+    for spec in detail.params:
+        if spec.required and spec.name not in params:
+            missing_params.append(spec.name)
+            continue
+        if spec.name in params and spec.type:
+            if not _param_matches_type(params[spec.name], spec.type):
+                invalid_params.append(
+                    {
+                        "name": spec.name,
+                        "expected": spec.type,
+                        "actual": type(params[spec.name]).__name__,
+                    }
+                )
+
+    missing_files: list[str] = []
+    for requirement in detail.required_files:
+        if not requirement.required:
+            continue
+        matches = _glob_required_files(requirement.pattern)
+        if not matches:
+            missing_files.append(requirement.pattern)
+
+    if missing_params or invalid_params or missing_files:
+        detail_payload: dict[str, Any] = {
+            "message": "Run requirements not satisfied",
+            "missing_params": missing_params or None,
+            "invalid_params": invalid_params or None,
+            "missing_files": missing_files or None,
+        }
+        raise HTTPException(status_code=400, detail=detail_payload)
+
+
+def _row_to_code_version_detail(row: sqlite3.Row) -> CodeVersionDetail:
+    return CodeVersionDetail(
+        version=row["version"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        author=row["author"],
+        note=row["note"],
+        code=row["code"],
+        pip_packages=json.loads(row["pip_packages"] or "[]"),
+        origin_run_id=row["origin_run_id"],
+        params=_parse_param_specs(row["params_model"] if "params_model" in row.keys() else None),
+        required_files=_parse_file_requirements(row["required_files"] if "required_files" in row.keys() else None),
+    )
+
+
+def _row_to_code_version_summary(row: sqlite3.Row) -> CodeVersionSummary:
+    return CodeVersionSummary(
+        version=row["version"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        author=row["author"],
+        note=row["note"],
+    )
+
+
+def _ensure_current_code_version() -> CodeVersionDetail:
+    _ensure_initial_code_version()
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            """
+            SELECT version, created_at, author, note, code, pip_packages, origin_run_id, params_model, required_files
+            FROM code_versions
+            ORDER BY version DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Failed to load current code version")
+        return _row_to_code_version_detail(row)
+    finally:
+        connection.close()
+
+
+def _get_code_version_detail(version: int) -> CodeVersionDetail:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            """
+            SELECT version, created_at, author, note, code, pip_packages, origin_run_id, params_model, required_files
+            FROM code_versions
+            WHERE version = ?
+            """,
+            (version,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Code version not found")
+        return _row_to_code_version_detail(row)
+    finally:
+        connection.close()
+
+
+def _resolve_code_version_detail(payload: E2BTestRequest) -> CodeVersionDetail:
+    current_detail = _ensure_current_code_version()
+    if payload.code_version and payload.code_version != current_detail.version:
+        return _get_code_version_detail(payload.code_version)
+    return current_detail
+
+
+def _list_code_versions(limit: int = 50) -> list[CodeVersionSummary]:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT version, created_at, author, note
+            FROM code_versions
+            ORDER BY version DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_row_to_code_version_summary(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def _create_code_version(
+    *,
+    code: str,
+    pip_packages: Sequence[str],
+    author: str,
+    note: str | None = None,
+    origin_run_id: str | None = None,
+    params: Sequence[ParamSpec] | None = None,
+    required_files: Sequence[FileRequirement] | None = None,
+) -> CodeVersionDetail:
+    now = datetime.now(timezone.utc)
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        cursor = connection.execute(
+            """
+            INSERT INTO code_versions (
+                created_at,
+                author,
+                note,
+                code,
+                pip_packages,
+                origin_run_id,
+                params_model,
+                required_files
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _iso(now),
+                author,
+                note,
+                code,
+                json.dumps(list(pip_packages)),
+                origin_run_id,
+                json.dumps(_params_to_dicts(params or [])),
+                json.dumps(_files_to_dicts(required_files or [])),
+            ),
+        )
+        version = cursor.lastrowid
+        connection.commit()
+    finally:
+        connection.close()
+    return _get_code_version_detail(version)
+
+
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row["name"] for row in rows}
+
+
+def _apply_schema_migrations(connection: sqlite3.Connection) -> None:
+    """Upgrade legacy tables to the current schema."""
+
+    code_version_columns = _table_columns(connection, "code_versions")
+    if "params_model" not in code_version_columns:
+        connection.execute(
+            "ALTER TABLE code_versions ADD COLUMN params_model TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "required_files" not in code_version_columns:
+        connection.execute(
+            "ALTER TABLE code_versions ADD COLUMN required_files TEXT NOT NULL DEFAULT '[]'"
+        )
+
+    run_columns = _table_columns(connection, "e2b_runs")
+    if "code_version" in run_columns:
+        return
+
+    legacy_rows = connection.execute(
+        """
+        SELECT id, created_at, code, params, pip_packages, allow_internet, ok, error, logs_path
+        FROM e2b_runs
+        ORDER BY created_at ASC
+        """
+    ).fetchall()
+
+    connection.execute("ALTER TABLE e2b_runs RENAME TO e2b_runs_legacy")
+    connection.execute(
+        """
+        CREATE TABLE e2b_runs (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            code_version INTEGER NOT NULL REFERENCES code_versions(version),
+            params TEXT NOT NULL,
+            pip_packages TEXT NOT NULL,
+            allow_internet INTEGER NOT NULL,
+            ok INTEGER,
+            error TEXT,
+            logs_path TEXT
+        )
+        """
+    )
+
+    for row in legacy_rows:
+        run_id = row["id"]
+        code_text = row["code"] or DEFAULT_CODE
+        pip_text = row["pip_packages"] or "[]"
+        try:
+            pip_list = json.loads(pip_text)
+        except json.JSONDecodeError:
+            pip_list = []
+
+        existing = connection.execute(
+            "SELECT version FROM code_versions WHERE origin_run_id = ? ORDER BY version DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if existing is not None:
+            version_id = existing["version"]
+        else:
+            detail = _create_code_version(
+                code=code_text,
+                pip_packages=pip_list,
+                author="system",
+                note=f"Migrated from run {run_id}",
+                origin_run_id=run_id,
+            )
+            version_id = detail.version
+
+        connection.execute(
+            """
+            INSERT INTO e2b_runs (
+                id,
+                created_at,
+                code_version,
+                params,
+                pip_packages,
+                allow_internet,
+                ok,
+                error,
+                logs_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                row["created_at"],
+                version_id,
+                row["params"],
+                pip_text,
+                row["allow_internet"],
+                row["ok"],
+                row["error"],
+                row["logs_path"],
+            ),
+        )
+
+    connection.execute("DROP TABLE e2b_runs_legacy")
+    connection.commit()
+
+
+def _build_version_chat_message(
+    *,
+    actor: str,
+    description: str,
+    version: CodeVersionDetail,
+    base_version: int | None = None,
+) -> str:
+    lines = [f"{actor} {description}. (version {version.version})"]
+    if base_version is not None:
+        lines.append(f"Based on version {base_version}.")
+    lines.append(f"<CodeOutput>{version.code}</CodeOutput>")
+    if version.pip_packages:
+        lines.append("<Pip>\n" + "\n".join(version.pip_packages) + "\n</Pip>")
+    if version.params:
+        params_json = json.dumps(_params_to_dicts(version.params), indent=2)
+        lines.append("<Params>\n" + params_json + "\n</Params>")
+    if version.required_files:
+        files_json = json.dumps(_files_to_dicts(version.required_files), indent=2)
+        lines.append("<FileList>\n" + files_json + "\n</FileList>")
+    return "\n".join(lines)
 def _write_run_metadata(run_dir: Path, metadata: dict[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = run_dir / "metadata.json"
@@ -147,6 +579,7 @@ def _save_run_record(
     run_dir: Path,
     persisted_files: Sequence[PersistedFile],
     logs_path: Path,
+    code_version: int,
 ) -> None:
     params_json = json.dumps(payload.params)
     pip_json = json.dumps(payload.pip_packages)
@@ -158,32 +591,48 @@ def _save_run_record(
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     try:
         connection.execute("PRAGMA foreign_keys = ON;")
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO e2b_runs (
-                id,
-                created_at,
-                code,
-                params,
-                pip_packages,
-                allow_internet,
-                ok,
-                error,
-                logs_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        try:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO e2b_runs (
+                    id,
+                    created_at,
+                    code_version,
+                    params,
+                    pip_packages,
+                    allow_internet,
+                    ok,
+                    error,
+                    logs_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    created_at,
+                    code_version,
+                    params_json,
+                    pip_json,
+                    allow_internet,
+                    ok_value,
+                    error_text,
+                    logs_relative,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            logger.error(
+                "Failed to persist run %s (code_version=%s): %s",
                 run_id,
-                created_at,
-                payload.code,
-                params_json,
-                pip_json,
-                allow_internet,
-                ok_value,
-                error_text,
-                logs_relative,
-            ),
-        )
+                code_version,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Unable to record run in history",
+                    "code_version": code_version,
+                    "error": str(exc),
+                },
+            ) from exc
 
         connection.execute(
             "DELETE FROM e2b_run_files WHERE run_id = ?",
@@ -239,6 +688,7 @@ def _finalize_run_record(
         "pip_packages": payload.pip_packages,
         "allow_internet": payload.allow_internet,
         "response": execution.response.model_dump(),
+        "code_version": execution.code_version,
     }
     _write_run_metadata(run_dir, metadata)
 
@@ -250,6 +700,7 @@ def _finalize_run_record(
         run_dir=run_dir,
         persisted_files=execution.persisted_files,
         logs_path=logs_path,
+        code_version=execution.code_version,
     )
 
 
@@ -259,14 +710,26 @@ def _execute_run(
     run_id: str,
     log_sink=None,
 ) -> SandboxExecutionResult:
+    version_detail = _resolve_code_version_detail(payload)
+    code_version = version_detail.version
+    logger.info(
+        "Executing run %s using code_version=%s (requested=%s)",
+        run_id,
+        code_version,
+        payload.code_version,
+    )
+    _validate_run_inputs(payload, version_detail)
     execution = execute_e2b_test(
         payload,
         log_sink=log_sink,
         run_id=run_id,
         persist_root=RUNS_ROOT,
+        code_version=code_version,
     )
     if execution.response.run_id is None:
         execution.response.run_id = run_id
+    if execution.response.code_version is None:
+        execution.response.code_version = code_version
     return execution
 
 class RunFileResponse(BaseModel):
@@ -281,6 +744,7 @@ class RunSummaryResponse(BaseModel):
     created_at: datetime
     ok: bool | None
     error: str | None
+    code_version: int
 
 
 class RunDetailResponse(RunSummaryResponse):
@@ -290,6 +754,62 @@ class RunDetailResponse(RunSummaryResponse):
     allow_internet: bool
     logs: list[str]
     files: list[RunFileResponse]
+    code_version: int
+
+
+class ParamSpec(BaseModel):
+    name: str = Field(..., min_length=1)
+    type: str | None = Field(default=None)
+    required: bool = True
+    description: str | None = None
+
+
+class FileRequirement(BaseModel):
+    pattern: str = Field(..., min_length=1)
+    required: bool = True
+    description: str | None = None
+
+
+class CodeVersionSummary(BaseModel):
+    version: int
+    created_at: datetime
+    author: str
+    note: str | None
+
+
+class CodeVersionDetail(CodeVersionSummary):
+    code: str
+    pip_packages: list[str]
+    origin_run_id: str | None
+    params: list[ParamSpec]
+    required_files: list[FileRequirement]
+
+
+class CodeVersionUpdateRequest(BaseModel):
+    code: str = Field(..., min_length=1)
+    pip_packages: list[str] = Field(default_factory=list)
+    note: str | None = None
+    params: list[ParamSpec] = Field(default_factory=list)
+    required_files: list[FileRequirement] = Field(default_factory=list)
+
+
+class CodeVersionRevertRequest(BaseModel):
+    version: int
+    note: str | None = None
+
+
+class CodeVersionUpdateResponse(BaseModel):
+    version: CodeVersionDetail
+    chat_message: str
+
+
+DEFAULT_CODE = '''def run(params, ctx):
+    """Default sandbox entrypoint."""
+
+    ctx.log("Starting default run")
+    return {"ok": True}
+'''
+DEFAULT_PIP_PACKAGES: list[str] = []
 
 
 def _iso(dt: datetime) -> str:
@@ -313,6 +833,18 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS code_versions (
+                version INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                author TEXT NOT NULL,
+                note TEXT,
+                code TEXT NOT NULL,
+                pip_packages TEXT NOT NULL,
+                origin_run_id TEXT,
+                params_model TEXT NOT NULL DEFAULT '[]',
+                required_files TEXT NOT NULL DEFAULT '[]'
+            );
+
             CREATE TABLE IF NOT EXISTS tool_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tool_id INTEGER NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
@@ -326,7 +858,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS e2b_runs (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
-                code TEXT NOT NULL,
+                code_version INTEGER NOT NULL REFERENCES code_versions(version),
                 params TEXT NOT NULL,
                 pip_packages TEXT NOT NULL,
                 allow_internet INTEGER NOT NULL,
@@ -346,6 +878,12 @@ def init_db() -> None:
         )
         connection.commit()
 
+    _ensure_initial_code_version()
+    with sqlite3.connect(DATABASE_PATH, check_same_thread=False) as connection:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.row_factory = sqlite3.Row
+        _apply_schema_migrations(connection)
+        connection.commit()
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -375,6 +913,37 @@ def row_to_tool_file(row: sqlite3.Row) -> ToolFile:
         size_bytes=row["size_bytes"],
         uploaded_at=datetime.fromisoformat(row["uploaded_at"]),
     )
+
+
+def validate_upload_contents(extension: str, contents: bytes) -> None:
+    if extension == ".csv":
+        try:
+            sample = contents.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:  # pragma: no cover
+            raise HTTPException(status_code=400, detail=f"CSV decode error: {exc}") from exc
+
+        reader = csv.reader(io.StringIO(sample))
+        try:
+            next(reader)
+        except StopIteration:
+            raise HTTPException(status_code=400, detail="CSV file appears to be empty")
+        except csv.Error as exc:
+            raise HTTPException(status_code=400, detail=f"CSV parsing failed: {exc}") from exc
+    elif extension == ".xlsx":
+        if openpyxl is None:  # pragma: no cover
+            return
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(contents), read_only=True)
+            workbook.close()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid XLSX file: {exc}") from exc
+    elif extension == ".xls":
+        if xlrd is None:  # pragma: no cover
+            return
+        try:
+            xlrd.open_workbook(file_contents=contents)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid XLS file: {exc}") from exc
 
 
 @asynccontextmanager
@@ -476,6 +1045,10 @@ def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
             display_text,
             code_snippet,
             pip_packages,
+            params_payload,
+            file_payload,
+            params_present,
+            files_present,
             prompt_tokens,
             completion_tokens,
             total_tokens,
@@ -489,26 +1062,148 @@ def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
     except Exception as exc:  # pragma: no cover - network interaction
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    current_detail = _ensure_current_code_version()
+
+    incoming_code = code_snippet.strip() if isinstance(code_snippet, str) else None
+    update_pip = bool(pip_packages) or code_snippet is not None
+    target_code = incoming_code if incoming_code is not None else current_detail.code
+    target_pip_packages = pip_packages if update_pip else current_detail.pip_packages
+    target_params = current_detail.params
+    if params_present:
+        target_params = _coerce_param_specs(params_payload)
+    target_files = current_detail.required_files
+    if files_present:
+        target_files = _coerce_file_requirements(file_payload)
+
+    changed = (
+        target_code != current_detail.code
+        or target_pip_packages != current_detail.pip_packages
+        or _params_to_dicts(target_params) != _params_to_dicts(current_detail.params)
+        or _files_to_dicts(target_files) != _files_to_dicts(current_detail.required_files)
+    )
+
+    if changed:
+        detail = _create_code_version(
+            code=target_code,
+            pip_packages=target_pip_packages,
+            author="assistant",
+            note="Assistant update",
+            origin_run_id=None,
+            params=target_params,
+            required_files=target_files,
+        )
+    else:
+        detail = current_detail
+
+    version_number = detail.version
+    target_code = detail.code
+    target_pip_packages = detail.pip_packages
+    target_params = detail.params
+    target_files = detail.required_files
+    code_snippet_value = target_code if (changed or code_snippet is not None) else None
+
     usage = _usage_from_tokens(prompt_tokens, completion_tokens, total_tokens)
     final_text = display_text.strip()
     if not final_text:
-        if pip_packages and code_snippet:
+        if changed and target_code != current_detail.code and target_pip_packages != current_detail.pip_packages:
             final_text = "Updated the sandbox module and pip requirements."
-        elif code_snippet:
+        elif changed and target_code != current_detail.code:
             final_text = "Updated the sandbox module."
-        elif pip_packages:
+        elif changed and target_pip_packages != current_detail.pip_packages:
             final_text = "Updated pip requirements."
+        elif changed:
+            final_text = "Updated sandbox metadata."
         else:
             final_text = "No changes were proposed."
+    if changed:
+        final_text = f"{final_text} (version {version_number})"
     assistant_message = ChatAssistantMessage(content=final_text)
 
     return ChatCompletionResponse(
         message=assistant_message,
-        code=code_snippet,
-        pip_packages=pip_packages,
+        code=code_snippet_value,
+        pip_packages=target_pip_packages,
         usage=usage,
         raw=raw_text,
+        version=version_number,
+        params=_params_to_dicts(target_params),
+        required_files=_files_to_dicts(target_files),
     )
+
+
+@app.get(
+    "/api/e2b-code/current",
+    response_model=CodeVersionDetail,
+    summary="Fetch the currently active code version",
+)
+def get_current_code_version() -> CodeVersionDetail:
+    return _ensure_current_code_version()
+
+
+@app.get(
+    "/api/e2b-code/versions",
+    response_model=list[CodeVersionSummary],
+    summary="List recent code versions",
+)
+def list_code_versions(limit: int = Query(20, ge=1, le=200)) -> list[CodeVersionSummary]:
+    return _list_code_versions(limit)
+
+
+@app.get(
+    "/api/e2b-code/versions/{version}",
+    response_model=CodeVersionDetail,
+    summary="Fetch a specific code version",
+)
+def get_code_version(version: int) -> CodeVersionDetail:
+    return _get_code_version_detail(version)
+
+
+@app.post(
+    "/api/e2b-code/versions",
+    response_model=CodeVersionUpdateResponse,
+    summary="Create a new manual code version",
+)
+def create_code_version_endpoint(request: CodeVersionUpdateRequest) -> CodeVersionUpdateResponse:
+    detail = _create_code_version(
+        code=request.code,
+        pip_packages=request.pip_packages,
+        author="user",
+        note=request.note or "Manual update",
+        origin_run_id=None,
+        params=request.params,
+        required_files=request.required_files,
+    )
+    message = _build_version_chat_message(
+        actor="User",
+        description="saved a manual code update",
+        version=detail,
+    )
+    return CodeVersionUpdateResponse(version=detail, chat_message=message)
+
+
+@app.post(
+    "/api/e2b-code/revert",
+    response_model=CodeVersionUpdateResponse,
+    summary="Create a new code version by reverting to a previous one",
+)
+def revert_code_version(request: CodeVersionRevertRequest) -> CodeVersionUpdateResponse:
+    base_detail = _get_code_version_detail(request.version)
+    detail = _create_code_version(
+        code=base_detail.code,
+        pip_packages=base_detail.pip_packages,
+        author="user",
+        note=request.note or f"Revert to version {request.version}",
+        origin_run_id=base_detail.origin_run_id,
+        params=base_detail.params,
+        required_files=base_detail.required_files,
+    )
+    message = _build_version_chat_message(
+        actor="User",
+        description=f"reverted the code to version {request.version}",
+        version=detail,
+        base_version=request.version,
+    )
+    return CodeVersionUpdateResponse(version=detail, chat_message=message)
 
 
 @app.post(
@@ -540,6 +1235,7 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
         except HTTPException as http_exc:  # propagate structured error
             _enqueue({"type": "error", "status": http_exc.status_code, "detail": http_exc.detail})
         except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception("Run %s failed", run_id, exc_info=exc)
             _enqueue({"type": "error", "status": 500, "detail": str(exc)})
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, "__EOF__")
@@ -563,7 +1259,7 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
 @app.get("/api/e2b-runs", response_model=list[RunSummaryResponse], summary="List sandbox runs")
 def list_e2b_runs(connection: sqlite3.Connection = Depends(get_db)) -> list[RunSummaryResponse]:
     rows = connection.execute(
-        "SELECT id, created_at, ok, error FROM e2b_runs ORDER BY created_at DESC"
+        "SELECT id, created_at, ok, error, code_version FROM e2b_runs ORDER BY created_at DESC"
     ).fetchall()
 
     summaries: list[RunSummaryResponse] = []
@@ -577,6 +1273,7 @@ def list_e2b_runs(connection: sqlite3.Connection = Depends(get_db)) -> list[RunS
                 created_at=created_at,
                 ok=ok_bool,
                 error=row["error"],
+                code_version=row["code_version"],
             )
         )
     return summaries
@@ -590,7 +1287,7 @@ def list_e2b_runs(connection: sqlite3.Connection = Depends(get_db)) -> list[RunS
 def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -> RunDetailResponse:
     run_row = connection.execute(
         """
-        SELECT id, created_at, code, params, pip_packages, allow_internet, ok, error, logs_path
+        SELECT id, created_at, code_version, params, pip_packages, allow_internet, ok, error, logs_path
         FROM e2b_runs
         WHERE id = ?
         """,
@@ -607,6 +1304,8 @@ def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -
     ok_value = run_row["ok"]
     ok_bool = None if ok_value is None else bool(ok_value)
     error_text = run_row["error"]
+    code_version = run_row["code_version"]
+    code_detail = _get_code_version_detail(code_version)
 
     run_dir = RUNS_ROOT / run_id
     logs_relative = run_row["logs_path"] or "logs.txt"
@@ -646,12 +1345,13 @@ def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -
         created_at=created_at,
         ok=ok_bool,
         error=error_text,
-        code=run_row["code"],
+        code=code_detail.code,
         params=params,
         pip_packages=pip_packages,
         allow_internet=allow_internet,
         logs=logs,
         files=files,
+        code_version=code_version,
     )
 
 
@@ -860,6 +1560,7 @@ async def upload_tool_files(
         contents = await upload.read()
         if not contents:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        validate_upload_contents(extension, contents)
         target_path.write_bytes(contents)
         upload_ts = _iso(datetime.now(timezone.utc))
 
@@ -901,3 +1602,45 @@ async def upload_tool_files(
         saved_files.append(row_to_tool_file(file_row))
 
     return saved_files
+
+
+@app.delete(
+    "/api/tools/{tool_id}/files/{file_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a file from a tool",
+)
+def delete_tool_file(
+    tool_id: int,
+    file_id: int,
+    connection: sqlite3.Connection = Depends(get_db),
+) -> Response:
+    file_row = connection.execute(
+        """
+        SELECT id, stored_filename
+        FROM tool_files
+        WHERE id = ? AND tool_id = ?
+        """,
+        (file_id, tool_id),
+    ).fetchone()
+
+    if file_row is None:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    connection.execute("DELETE FROM tool_files WHERE id = ?", (file_id,))
+    connection.commit()
+
+    stored_filename = file_row["stored_filename"]
+    file_path = UPLOAD_ROOT / str(tool_id) / stored_filename
+    with suppress(FileNotFoundError):
+        file_path.unlink()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+try:
+    import openpyxl
+except ModuleNotFoundError:  # pragma: no cover
+    openpyxl = None
+
+try:
+    import xlrd
+except ModuleNotFoundError:  # pragma: no cover
+    xlrd = None

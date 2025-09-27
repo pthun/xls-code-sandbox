@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { Trash2 } from "lucide-react";
 import { useOutletContext } from "react-router";
 
 import { Button } from "~/components/ui/button";
@@ -9,7 +10,7 @@ import { Label } from "~/components/ui/label";
 import type { ToolLayoutContextValue } from "./_app.tools";
 
 export default function ToolFilesView() {
-  const { tool, handleUpload, uploadState } =
+  const { tool, handleUpload, deleteFile, activityState } =
     useOutletContext<ToolLayoutContextValue>();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
@@ -86,16 +87,6 @@ export default function ToolFilesView() {
         </Button>
       </form>
 
-      {uploadState.isUploading && (
-        <p className="text-xs text-muted-foreground">Uploading files…</p>
-      )}
-      {uploadState.error && (
-        <p className="text-xs text-destructive">{uploadState.error}</p>
-      )}
-      {uploadState.feedback && (
-        <p className="text-xs text-muted-foreground">{uploadState.feedback}</p>
-      )}
-
       <section className="space-y-3">
         <h2 className="text-lg font-semibold">Uploaded files</h2>
         {tool.files.length === 0 ? (
@@ -107,25 +98,44 @@ export default function ToolFilesView() {
             {tool.files.map((file) => (
               <li
                 key={file.id}
-                className="rounded-md border border-border px-4 py-3"
+                className="flex flex-col gap-2 rounded-md border border-border px-4 py-3 md:flex-row md:items-center md:justify-between"
               >
-                <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-                  <div>
-                    <p className="text-sm font-medium">{file.original_filename}</p>
-                    <p className="text-xs text-muted-foreground">
-                      Uploaded {new Date(file.uploaded_at).toLocaleString()}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                <div>
+                  <p className="text-sm font-medium">{file.original_filename}</p>
+                  <p className="text-xs text-muted-foreground">
+                    Uploaded {new Date(file.uploaded_at).toLocaleString()}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="flex flex-col text-xs text-muted-foreground md:items-end">
                     {file.content_type && <span>{file.content_type}</span>}
                     <span className="font-mono">{file.stored_filename}</span>
                   </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => deleteFile(file.id)}
+                    aria-label={`Remove ${file.original_filename}`}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
                 </div>
               </li>
             ))}
           </ul>
         )}
       </section>
+
+      {activityState.isProcessing && (
+        <p className="text-xs text-muted-foreground">Working…</p>
+      )}
+      {activityState.error && (
+        <p className="text-xs text-destructive">{activityState.error}</p>
+      )}
+      {activityState.message && (
+        <p className="text-xs text-muted-foreground">{activityState.message}</p>
+      )}
     </section>
   );
 }

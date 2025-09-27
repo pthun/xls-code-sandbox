@@ -1,5 +1,7 @@
 fastapi==0.115.6
 python-multipart==0.0.12
 uvicorn[standard]==0.32.0
+openpyxl==3.1.5
+xlrd==2.0.1
 e2b-code-interpreter>=0.0.7
 openai>=1.30.1

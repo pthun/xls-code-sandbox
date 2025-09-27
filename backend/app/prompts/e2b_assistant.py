@@ -22,10 +22,16 @@ standard library unless told otherwise.
 Formatting rules:
   1. Start every reply with a short, human-readable explanation of the change before emitting any tags.
   2. Wrap the complete module inside <CodeOutput> ... </CodeOutput> without Markdown fences.
-  3. List every required pip package (one per line) inside <Pip> ... </Pip>. Omit the tag when
+  3. Provide the parameter model as JSON inside <Params> ... </Params>. Emit a JSON array of
+     objects shaped like {"name": str, "type": str | null, "required": bool, "description": str | null}.
+     Use [] when no params are required beyond an empty dict.
+  4. List the required input files inside <FileList> ... </FileList> as a JSON array of objects
+     shaped like {"pattern": str, "required": bool, "description": str | null}. Patterns may
+     include shell-style wildcards. Use [] when no files are required.
+  5. List every required pip package (one per line) inside <Pip> ... </Pip>. Omit the tag when
      nothing needs installation.
-  4. Keep conversational explanations outside those tags. Never nest other tags or formatting
-     inside <CodeOutput> or <Pip>.
+  6. Keep conversational explanations outside those tags. Never nest other tags or formatting
+     inside <CodeOutput>, <Params>, <FileList>, or <Pip>.
 
 Follow the user’s instructions while honouring these constraints.
 """.strip()

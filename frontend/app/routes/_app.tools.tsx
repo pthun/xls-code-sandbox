@@ -27,10 +27,11 @@ export type ToolLayoutContextValue = {
   tool: ToolDetail;
   revalidate: () => void;
   handleUpload: (files: File[]) => Promise<void>;
-  uploadState: {
-    isUploading: boolean;
+  deleteFile: (fileId: number) => Promise<void>;
+  activityState: {
+    isProcessing: boolean;
     error: string | null;
-    feedback: string | null;
+    message: string | null;
   };
 };
 
@@ -59,20 +60,20 @@ export async function loader({ params }: Route.LoaderArgs) {
 export default function ToolLayout() {
   const { tool } = useLoaderData<typeof loader>();
   const revalidator = useRevalidator();
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [uploadFeedback, setUploadFeedback] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   async function handleUpload(files: File[]) {
     if (files.length === 0) {
-      setUploadError("Select at least one file to upload.");
-      setUploadFeedback(null);
+      setStatusError("Select at least one file to upload.");
+      setStatusMessage(null);
       return;
     }
 
-    setIsUploading(true);
-    setUploadError(null);
-    setUploadFeedback(null);
+    setIsProcessing(true);
+    setStatusError(null);
+    setStatusMessage(null);
 
     try {
       const formData = new FormData();
@@ -96,14 +97,47 @@ export default function ToolLayout() {
 
       const uploaded = await response.json();
       const count = Array.isArray(uploaded) ? uploaded.length : 0;
-      setUploadFeedback(
+      setStatusMessage(
         count === 1 ? "1 file uploaded successfully." : `${count} files uploaded successfully.`
       );
       revalidator.revalidate();
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : "Upload failed");
+      setStatusError(error instanceof Error ? error.message : "Upload failed");
     } finally {
-      setIsUploading(false);
+      setIsProcessing(false);
+    }
+  }
+
+  async function deleteFile(fileId: number) {
+    setIsProcessing(true);
+    setStatusError(null);
+    setStatusMessage(null);
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/tools/${tool.id}/files/${fileId}`,
+        {
+          method: "DELETE",
+        }
+      );
+
+      if (!response.ok) {
+        let detail = "Failed to delete file";
+        try {
+          const payload = (await response.json()) as { detail?: string };
+          if (payload?.detail) detail = payload.detail;
+        } catch (error) {
+          console.error(error);
+        }
+        throw new Error(detail);
+      }
+
+      setStatusMessage("File removed successfully.");
+      revalidator.revalidate();
+    } catch (error) {
+      setStatusError(error instanceof Error ? error.message : "Delete failed");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
@@ -111,16 +145,17 @@ export default function ToolLayout() {
     tool,
     revalidate: () => revalidator.revalidate(),
     handleUpload,
-    uploadState: {
-      isUploading,
-      error: uploadError,
-      feedback: uploadFeedback,
+    deleteFile,
+    activityState: {
+      isProcessing,
+      error: statusError,
+      message: statusMessage,
     },
   };
 
   return (
     <div className="flex flex-col gap-6 lg:flex-row">
-      <aside className="w-full space-y-4 lg:w-80 lg:shrink-0">
+      <aside className="w-full space-y-4 lg:w-56 lg:shrink-0">
         <div>
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
             Tool settings
@@ -156,14 +191,6 @@ export default function ToolLayout() {
           </nav>
         </div>
 
-        <div className="rounded-md border border-border/60 bg-muted/10 px-3 py-2 text-xs text-muted-foreground">
-          {isUploading && <p>Uploading files…</p>}
-          {uploadError && <p className="text-destructive">{uploadError}</p>}
-          {uploadFeedback && <p>{uploadFeedback}</p>}
-          {!isUploading && !uploadError && !uploadFeedback && (
-            <p>Select an option to manage this tool.</p>
-          )}
-        </div>
       </aside>
 
       <div className="flex-1">

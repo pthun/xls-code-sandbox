@@ -21,6 +21,10 @@ class E2BTestRequest(BaseModel):
         default_factory=list,
         description="Packages to install via pip before running the script",
     )
+    code_version: int | None = Field(
+        default=None,
+        description="Identifier of the code version associated with this run",
+    )
 
 
 class E2BFileInfo(BaseModel):
@@ -35,6 +39,7 @@ class E2BTestResponse(BaseModel):
     """Structured response returned after sandbox execution."""
 
     run_id: str | None = None
+    code_version: int | None = None
     ok: bool
     sandbox_id: str
     logs: list[str]

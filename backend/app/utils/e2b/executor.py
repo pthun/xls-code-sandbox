@@ -34,6 +34,7 @@ class SandboxExecutionResult:
     persisted_files: list[PersistedFile]
     logs_path: Path | None
     run_dir: Path | None
+    code_version: int
 
 
 E2B_APP_DIR = "/app"
@@ -416,6 +417,7 @@ def execute_e2b_test(
     log_sink: LogSink | None = None,
     run_id: str | None = None,
     persist_root: Path | None = None,
+    code_version: int,
 ) -> SandboxExecutionResult:
     """Spin up a sandbox, run the supplied code, and optionally persist artefacts."""
 
@@ -528,6 +530,7 @@ def execute_e2b_test(
                         )
                     response = E2BTestResponse(
                         run_id=run_id,
+                        code_version=code_version,
                         ok=False,
                         sandbox_id=getattr(sandbox, "sandbox_id", "unknown"),
                         logs=combined_logs,
@@ -539,6 +542,7 @@ def execute_e2b_test(
                         persisted_files=persisted_files,
                         logs_path=logs_path,
                         run_dir=run_dir,
+                        code_version=code_version,
                     )
 
         command_handle = sandbox.commands.run(
@@ -612,6 +616,7 @@ def execute_e2b_test(
 
         response = E2BTestResponse(
             run_id=run_id,
+            code_version=code_version,
             ok=exit_error is None,
             sandbox_id=sandbox_id,
             logs=log_lines,
@@ -623,6 +628,7 @@ def execute_e2b_test(
             persisted_files=persisted_files,
             logs_path=logs_path,
             run_dir=run_dir,
+            code_version=code_version,
         )
     finally:
         if hasattr(sandbox, "close"):

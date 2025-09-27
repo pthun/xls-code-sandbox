@@ -53,20 +53,37 @@ type ChatMessage = {
   kind?: "run-result";
 };
 
+type ParamSpec = {
+  name: string;
+  type?: string | null;
+  required: boolean;
+  description?: string | null;
+};
+
+type FileRequirement = {
+  pattern: string;
+  required: boolean;
+  description?: string | null;
+};
+
 type ChatApiResponse = {
   message: { role: "assistant"; content: string };
   code: string | null;
   pip_packages: string[];
+  params: ParamSpec[];
+  required_files: FileRequirement[];
   usage?: {
     prompt_tokens?: number | null;
     completion_tokens?: number | null;
     total_tokens?: number | null;
   } | null;
   raw?: string | null;
+  version?: number | null;
 };
 
 type SandboxRunResult = {
   runId: string;
+  codeVersion: number | null;
   ok: boolean;
   sandboxId: string;
   logs: string[];
@@ -96,6 +113,7 @@ type RunSummary = {
   created_at: string;
   ok: boolean | null;
   error: string | null;
+  code_version: number;
 };
 
 type RunFileRecord = {
@@ -112,6 +130,26 @@ type RunDetail = RunSummary & {
   allow_internet: boolean;
   logs: string[];
   files: RunFileRecord[];
+};
+
+type CodeVersionSummary = {
+  version: number;
+  created_at: string;
+  author: string;
+  note: string | null;
+};
+
+type CodeVersionDetail = CodeVersionSummary & {
+  code: string;
+  pip_packages: string[];
+  origin_run_id: string | null;
+  params: ParamSpec[];
+  required_files: FileRequirement[];
+};
+
+type CodeVersionUpdateResponse = {
+  version: CodeVersionDetail;
+  chat_message: string;
 };
 
 export function meta({}: Route.MetaArgs) {
@@ -148,10 +186,180 @@ function formatDateTime(value: string) {
   return date.toLocaleString();
 }
 
+function parsePipLines(text: string) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function normalizeDescription(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+function parseParamSpecsJson(text: string): ParamSpec[] {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error("Params must be valid JSON.");
+  }
+  if (!Array.isArray(data)) {
+    throw new Error("Params must be a JSON array.");
+  }
+  return data.map((item) => {
+    if (!item || typeof item !== "object") {
+      throw new Error("Each param entry must be an object.");
+    }
+    const name = typeof (item as Record<string, unknown>).name === "string"
+      ? (item as Record<string, unknown>).name.trim()
+      : "";
+    if (!name) {
+      throw new Error("Each param requires a non-empty name.");
+    }
+    const typeValue = (item as Record<string, unknown>).type;
+    const descriptionValue = (item as Record<string, unknown>).description;
+    return {
+      name,
+      type: typeof typeValue === "string" && typeValue.trim().length > 0 ? typeValue.trim() : null,
+      required:
+        typeof (item as Record<string, unknown>).required === "boolean"
+          ? (item as Record<string, unknown>).required
+          : true,
+      description: normalizeDescription(descriptionValue) ?? null,
+    } satisfies ParamSpec;
+  });
+}
+
+function parseFileRequirementsJson(text: string): FileRequirement[] {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error("Required files must be valid JSON.");
+  }
+  if (!Array.isArray(data)) {
+    throw new Error("Required files must be a JSON array.");
+  }
+  return data.map((item) => {
+    if (!item || typeof item !== "object") {
+      throw new Error("Each required file entry must be an object.");
+    }
+    const pattern = typeof (item as Record<string, unknown>).pattern === "string"
+      ? (item as Record<string, unknown>).pattern.trim()
+      : "";
+    if (!pattern) {
+      throw new Error("Each file requirement needs a pattern.");
+    }
+    const descriptionValue = (item as Record<string, unknown>).description;
+    return {
+      pattern,
+      required:
+        typeof (item as Record<string, unknown>).required === "boolean"
+          ? (item as Record<string, unknown>).required
+          : true,
+      description: normalizeDescription(descriptionValue) ?? null,
+    } satisfies FileRequirement;
+  });
+}
+
+function stringifyParamSpecs(specs: ParamSpec[]) {
+  if (!specs.length) return "";
+  return JSON.stringify(
+    specs.map((spec) => ({
+      name: spec.name,
+      type: spec.type ?? null,
+      required: spec.required,
+      description: spec.description ?? null,
+    })),
+    null,
+    2,
+  );
+}
+
+function stringifyFileRequirements(requirements: FileRequirement[]) {
+  if (!requirements.length) return "";
+  return JSON.stringify(
+    requirements.map((req) => ({
+      pattern: req.pattern,
+      required: req.required,
+      description: req.description ?? null,
+    })),
+    null,
+    2,
+  );
+}
+
+function formatRunError(detail: unknown, fallback = "Sandbox run failed.") {
+  if (!detail) return fallback;
+  if (typeof detail === "string") return detail;
+  if (typeof detail !== "object") return fallback;
+  const record = detail as Record<string, unknown>;
+  const parts: string[] = [];
+  if (typeof record.message === "string" && record.message.trim().length > 0) {
+    parts.push(record.message.trim());
+  }
+  const missingParams = Array.isArray(record.missing_params)
+    ? (record.missing_params as unknown[]).filter((item): item is string => typeof item === "string")
+    : [];
+  if (missingParams.length) {
+    parts.push(`Missing params: ${missingParams.join(", ")}.`);
+  }
+  const invalidParams = Array.isArray(record.invalid_params)
+    ? (record.invalid_params as unknown[]).filter(
+        (item): item is { name?: string; expected?: string } =>
+          !!item && typeof item === "object" && "name" in item
+      )
+    : [];
+  if (invalidParams.length) {
+    const formatted = invalidParams
+      .map((item) => {
+        const name = typeof (item as Record<string, unknown>).name === "string"
+          ? (item as Record<string, unknown>).name
+          : "unknown";
+        const expected = typeof (item as Record<string, unknown>).expected === "string"
+          ? (item as Record<string, unknown>).expected
+          : "";
+        const actual = typeof (item as Record<string, unknown>).actual === "string"
+          ? (item as Record<string, unknown>).actual
+          : "";
+        if (expected && actual) {
+          return `${name} (expected ${expected}, got ${actual})`;
+        }
+        return expected ? `${name} (expected ${expected})` : name;
+      })
+      .join(", ");
+    parts.push(`Param type mismatch: ${formatted}.`);
+  }
+  const missingFiles = Array.isArray(record.missing_files)
+    ? (record.missing_files as unknown[]).filter((item): item is string => typeof item === "string")
+    : [];
+  if (missingFiles.length) {
+    parts.push(`Missing files: ${missingFiles.join(", ")}.`);
+  }
+  if (parts.length === 0) {
+    return fallback;
+  }
+  return parts.join(" ");
+}
+
 function buildRunResultMessage(result: SandboxRunResult, logLines: string[]): string {
   const lines: string[] = ["<RunResult>", `status: ${result.ok ? "success" : "failure"}`];
   if (result.runId) {
     lines.push(`run_id: ${result.runId}`);
+  }
+  if (result.codeVersion != null) {
+    lines.push(`code_version: ${result.codeVersion}`);
   }
   if (result.error) {
     lines.push(`error: ${result.error}`);
@@ -190,6 +398,8 @@ export default function E2BAssistantRoute() {
   const [input, setInput] = useState("");
   const [currentCode, setCurrentCode] = useState<string>(DEFAULT_CODE);
   const [pipPackages, setPipPackages] = useState<string[]>([]);
+  const [paramSpecs, setParamSpecs] = useState<ParamSpec[]>([]);
+  const [requiredFiles, setRequiredFiles] = useState<FileRequirement[]>([]);
   const [paramsText, setParamsText] = useState<string>(DEFAULT_PARAMS);
 
   const [chatError, setChatError] = useState<string | null>(null);
@@ -206,9 +416,65 @@ export default function E2BAssistantRoute() {
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [isRunDetailLoading, setIsRunDetailLoading] = useState(false);
   const [runDetailError, setRunDetailError] = useState<string | null>(null);
+  const [currentVersion, setCurrentVersion] = useState<number | null>(null);
+  const [codeLoadError, setCodeLoadError] = useState<string | null>(null);
+  const [isCodeLoading, setIsCodeLoading] = useState(false);
+  const [versions, setVersions] = useState<CodeVersionSummary[]>([]);
+  const [isVersionsLoading, setIsVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
+  const [showEditor, setShowEditor] = useState(false);
+  const [draftCode, setDraftCode] = useState("");
+  const [draftPip, setDraftPip] = useState("");
+  const [draftParams, setDraftParams] = useState("");
+  const [draftFilePatterns, setDraftFilePatterns] = useState("");
+  const [editorNote, setEditorNote] = useState("");
+  const [isSavingVersion, setIsSavingVersion] = useState(false);
+  const [versionActionError, setVersionActionError] = useState<string | null>(null);
 
   const [showCode, setShowCode] = useState(false);
   const [showPip, setShowPip] = useState(false);
+
+  const fetchCurrentCodeVersion = useCallback(async () => {
+    try {
+      setIsCodeLoading(true);
+      setCodeLoadError(null);
+      const response = await fetch(`${API_BASE_URL}/api/e2b-code/current`);
+      if (!response.ok) {
+        throw new Error(`Failed to load current code (${response.status})`);
+      }
+      const data = (await response.json()) as CodeVersionDetail;
+      setCurrentCode(data.code);
+      setPipPackages(data.pip_packages);
+      setCurrentVersion(data.version);
+      setParamSpecs(data.params ?? []);
+      setRequiredFiles(data.required_files ?? []);
+    } catch (error) {
+      setCodeLoadError(
+        error instanceof Error ? error.message : "Unable to load current code"
+      );
+    } finally {
+      setIsCodeLoading(false);
+    }
+  }, []);
+
+  const fetchVersions = useCallback(async () => {
+    try {
+      setIsVersionsLoading(true);
+      setVersionsError(null);
+      const response = await fetch(`${API_BASE_URL}/api/e2b-code/versions`);
+      if (!response.ok) {
+        throw new Error(`Failed to load code versions (${response.status})`);
+      }
+      const data = (await response.json()) as CodeVersionSummary[];
+      setVersions(data);
+    } catch (error) {
+      setVersionsError(
+        error instanceof Error ? error.message : "Unable to load code versions"
+      );
+    } finally {
+      setIsVersionsLoading(false);
+    }
+  }, []);
 
   const fetchRunHistory = useCallback(async () => {
     try {
@@ -253,7 +519,9 @@ export default function E2BAssistantRoute() {
 
   useEffect(() => {
     void fetchRunHistory();
-  }, [fetchRunHistory]);
+    void fetchCurrentCodeVersion();
+    void fetchVersions();
+  }, [fetchRunHistory, fetchCurrentCodeVersion, fetchVersions]);
 
   const handleSend = useCallback(
     async (event?: FormEvent<HTMLFormElement>) => {
@@ -293,6 +561,20 @@ export default function E2BAssistantRoute() {
           });
         }
 
+        if (paramSpecs.length > 0) {
+          history.push({
+            role: "user",
+            content: `Current params model:\n<Params>\n${JSON.stringify(paramSpecs, null, 2)}\n</Params>`,
+          });
+        }
+
+        if (requiredFiles.length > 0) {
+          history.push({
+            role: "user",
+            content: `Required files:\n<FileList>\n${JSON.stringify(requiredFiles, null, 2)}\n</FileList>`,
+          });
+        }
+
         history.push({ role: "user", content });
 
         const response = await fetch(`${API_BASE_URL}/api/e2b-chat`, {
@@ -324,6 +606,19 @@ export default function E2BAssistantRoute() {
         if (Array.isArray(payload.pip_packages)) {
           setPipPackages(payload.pip_packages);
         }
+
+        if (Array.isArray(payload.params)) {
+          setParamSpecs(payload.params);
+        }
+
+        if (Array.isArray(payload.required_files)) {
+          setRequiredFiles(payload.required_files);
+        }
+
+        if (typeof payload.version === "number") {
+          setCurrentVersion(payload.version);
+          void fetchVersions();
+        }
       } catch (error) {
         const message =
           error instanceof Error ? error.message : "Failed to contact the assistant";
@@ -332,7 +627,16 @@ export default function E2BAssistantRoute() {
         setIsGenerating(false);
       }
     },
-    [input, isGenerating, messages, currentCode, pipPackages]
+    [
+      input,
+      isGenerating,
+      messages,
+      currentCode,
+      pipPackages,
+      paramSpecs,
+      requiredFiles,
+      fetchVersions,
+    ]
   );
 
   const handleRun = useCallback(async () => {
@@ -369,6 +673,7 @@ export default function E2BAssistantRoute() {
           allow_internet: pipPackages.length > 0,
           params: parsedParams,
           pip_packages: pipPackages,
+          code_version: currentVersion,
         }),
       });
 
@@ -406,6 +711,7 @@ export default function E2BAssistantRoute() {
           const payload = event.data;
           const normalized: SandboxRunResult = {
             runId: payload.run_id ?? "",
+            codeVersion: typeof payload.code_version === "number" ? payload.code_version : null,
             ok: payload.ok ?? true,
             sandboxId: payload.sandbox_id,
             logs: payload.logs ?? [],
@@ -444,10 +750,10 @@ export default function E2BAssistantRoute() {
         }
 
         if (event.type === "error") {
-          const detailText =
-            typeof event.detail === "string"
-              ? event.detail
-              : event.message || "Sandbox run failed.";
+          const detailText = formatRunError(
+            event.detail,
+            typeof event.message === "string" ? event.message : "Sandbox run failed."
+          );
           setRunError(detailText);
         }
       };
@@ -484,6 +790,123 @@ export default function E2BAssistantRoute() {
     fetchRunHistory,
     fetchRunDetail,
   ]);
+
+  const handleOpenEditor = useCallback(() => {
+    setShowEditor(true);
+    setVersionActionError(null);
+    setDraftCode(currentCode);
+    setDraftPip(pipPackages.join("\n"));
+    setDraftParams(stringifyParamSpecs(paramSpecs));
+    setDraftFilePatterns(stringifyFileRequirements(requiredFiles));
+    setEditorNote("");
+  }, [currentCode, pipPackages, paramSpecs, requiredFiles]);
+
+  const handleCancelEditor = useCallback(() => {
+    setShowEditor(false);
+    setVersionActionError(null);
+  }, []);
+
+  const handleSaveManualEdit = useCallback(async () => {
+    if (!draftCode.trim()) {
+      setVersionActionError("Code cannot be empty.");
+      return;
+    }
+
+    let parsedParams: ParamSpec[] = [];
+    let parsedFiles: FileRequirement[] = [];
+    try {
+      parsedParams = parseParamSpecsJson(draftParams);
+      parsedFiles = parseFileRequirementsJson(draftFilePatterns);
+    } catch (metadataError) {
+      setVersionActionError(
+        metadataError instanceof Error ? metadataError.message : "Invalid metadata format"
+      );
+      return;
+    }
+
+    try {
+      setIsSavingVersion(true);
+      setVersionActionError(null);
+      const body = JSON.stringify({
+        code: draftCode,
+        pip_packages: parsePipLines(draftPip),
+        params: parsedParams,
+        required_files: parsedFiles,
+        note: editorNote.trim() || undefined,
+      });
+      const response = await fetch(`${API_BASE_URL}/api/e2b-code/versions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Failed to save code version (${response.status})`);
+      }
+      const data = (await response.json()) as CodeVersionUpdateResponse;
+      setCurrentCode(data.version.code);
+      setPipPackages(data.version.pip_packages);
+      setCurrentVersion(data.version.version);
+      setParamSpecs(data.version.params ?? []);
+      setRequiredFiles(data.version.required_files ?? []);
+      setMessages((prev) => [
+        ...prev,
+        { id: createId(), role: "user", content: data.chat_message },
+      ]);
+      setShowEditor(false);
+      await fetchVersions();
+    } catch (error) {
+      setVersionActionError(
+        error instanceof Error ? error.message : "Unable to save code changes"
+      );
+    } finally {
+      setIsSavingVersion(false);
+    }
+  }, [draftCode, draftPip, draftParams, draftFilePatterns, editorNote, fetchVersions]);
+
+  const handleRevertVersion = useCallback(
+    async (targetVersion: number, noteOverride?: string) => {
+      const noteFromPrompt =
+        typeof noteOverride === "string"
+          ? noteOverride
+          : window.prompt("Optional note for this revert:", "") ?? "";
+      const finalNote = noteFromPrompt.trim();
+      try {
+        setIsSavingVersion(true);
+        setVersionActionError(null);
+        const response = await fetch(`${API_BASE_URL}/api/e2b-code/revert`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            version: targetVersion,
+            note: finalNote || undefined,
+          }),
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `Failed to revert code (${response.status})`);
+        }
+        const data = (await response.json()) as CodeVersionUpdateResponse;
+        setCurrentCode(data.version.code);
+        setPipPackages(data.version.pip_packages);
+        setCurrentVersion(data.version.version);
+        setParamSpecs(data.version.params ?? []);
+        setRequiredFiles(data.version.required_files ?? []);
+        setMessages((prev) => [
+          ...prev,
+          { id: createId(), role: "user", content: data.chat_message },
+        ]);
+        await fetchVersions();
+      } catch (error) {
+        setVersionActionError(
+          error instanceof Error ? error.message : "Unable to revert code"
+        );
+      } finally {
+        setIsSavingVersion(false);
+      }
+    },
+    [fetchVersions]
+  );
 
   const handleSelectRun = useCallback(
     async (runId: string) => {
@@ -754,7 +1177,10 @@ export default function E2BAssistantRoute() {
                           <span>
                             Status: {run.ok == null ? "unknown" : run.ok ? "success" : "failure"}
                           </span>
-                          {run.error && <span className="text-destructive">{run.error}</span>}
+                          <span>
+                            Version {run.code_version}
+                            {run.error ? ` · ${run.error}` : ""}
+                          </span>
                         </div>
                       </div>
                     </li>
@@ -799,6 +1225,17 @@ export default function E2BAssistantRoute() {
                   {runDetail.error && (
                     <p className="text-xs text-destructive">{runDetail.error}</p>
                   )}
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Code version {runDetail.code_version}</span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => handleRevertVersion(runDetail.code_version, `Revert from run ${runDetail.id}`)}
+                    >
+                      Revert to this version
+                    </Button>
+                  </div>
 
                   <section className="space-y-2">
                     <h3 className="text-sm font-semibold">Code snapshot</h3>
@@ -885,7 +1322,10 @@ export default function E2BAssistantRoute() {
           <CardHeader className="flex items-center justify-between gap-2">
             <div>
               <CardTitle>Latest code</CardTitle>
-              <CardDescription>View or copy the module sent to the sandbox.</CardDescription>
+              <CardDescription>
+                Active module (version {currentVersion ?? "?"}). View or copy the script used for
+                upcoming runs.
+              </CardDescription>
             </div>
             <Button
               type="button"
@@ -897,12 +1337,156 @@ export default function E2BAssistantRoute() {
             </Button>
           </CardHeader>
           {showCode && (
-            <CardContent>
-              <pre className="max-h-[480px] overflow-y-auto rounded-md border border-border bg-muted/30 p-3 text-xs">
-                {currentCode.trim() || "No code generated yet."}
-              </pre>
+            <CardContent className="space-y-2">
+              {codeLoadError && (
+                <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  {codeLoadError}
+                </p>
+              )}
+              {isCodeLoading ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" /> Loading code…
+                </div>
+              ) : (
+                <pre className="max-h-[480px] overflow-y-auto rounded-md border border-border bg-muted/30 p-3 text-xs">
+                  {currentCode.trim() || "No code generated yet."}
+                </pre>
+              )}
             </CardContent>
           )}
+        </Card>
+
+        <Card>
+          <CardHeader className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle>Code versions</CardTitle>
+              <CardDescription>Track history, revert, or edit the sandbox module.</CardDescription>
+            </div>
+            <Button type="button" size="sm" onClick={handleOpenEditor}>
+              Edit code
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {versionActionError && (
+              <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {versionActionError}
+              </p>
+            )}
+
+            {showEditor && (
+              <div className="space-y-3 rounded-md border border-border bg-muted/10 p-3">
+                <textarea
+                  className="min-h-[200px] w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  value={draftCode}
+                  onChange={(event) => setDraftCode(event.target.value)}
+                />
+                <div className="space-y-1 text-xs text-muted-foreground">
+                  <Label htmlFor="manual-pip">Pip requirements (one per line)</Label>
+                  <textarea
+                    id="manual-pip"
+                    className="min-h-[96px] w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    value={draftPip}
+                    onChange={(event) => setDraftPip(event.target.value)}
+                  />
+                </div>
+                <div className="space-y-1 text-xs text-muted-foreground">
+                  <Label htmlFor="manual-params">Params model JSON</Label>
+                  <textarea
+                    id="manual-params"
+                    className="min-h-[120px] w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    value={draftParams}
+                    onChange={(event) => setDraftParams(event.target.value)}
+                    placeholder="[]"
+                  />
+                  <p>
+                    {"List objects like {\"name\": \"customer_id\", \"type\": \"string\", \"required\": true}."}
+                  </p>
+                </div>
+                <div className="space-y-1 text-xs text-muted-foreground">
+                  <Label htmlFor="manual-files">Required files JSON</Label>
+                  <textarea
+                    id="manual-files"
+                    className="min-h-[120px] w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    value={draftFilePatterns}
+                    onChange={(event) => setDraftFilePatterns(event.target.value)}
+                    placeholder="[]"
+                  />
+                  <p>
+                    {"Patterns support wildcards, e.g. {\"pattern\": \"inputs/*.csv\"}."}
+                  </p>
+                </div>
+                <div className="space-y-1 text-xs text-muted-foreground">
+                  <Label htmlFor="manual-note">Optional note</Label>
+                  <input
+                    id="manual-note"
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    value={editorNote}
+                    onChange={(event) => setEditorNote(event.target.value)}
+                    placeholder="e.g. Adjust logging"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <Button type="button" variant="ghost" onClick={handleCancelEditor}>
+                    Cancel
+                  </Button>
+                  <Button type="button" onClick={handleSaveManualEdit} disabled={isSavingVersion}>
+                    {isSavingVersion ? (
+                      <>
+                        <Loader2 className="mr-2 size-4 animate-spin" /> Saving…
+                      </>
+                    ) : (
+                      "Save version"
+                    )}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {versionsError && (
+              <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {versionsError}
+              </p>
+            )}
+
+            {isVersionsLoading ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" /> Loading versions…
+              </div>
+            ) : versions.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No versions recorded yet. Edits will appear here.
+              </p>
+            ) : (
+              <ul className="space-y-2 text-sm">
+                {versions.map((version) => (
+                  <li
+                    key={version.version}
+                    className="rounded-md border border-border bg-muted/20 px-3 py-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="font-medium">
+                          Version {version.version} · {version.author}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          {formatDateTime(version.created_at)}
+                          {version.note ? ` · ${version.note}` : ""}
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleRevertVersion(version.version)}
+                      >
+                        Revert
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
         </Card>
 
         <Card>
@@ -935,6 +1519,65 @@ export default function E2BAssistantRoute() {
               )}
             </CardContent>
           )}
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Param requirements</CardTitle>
+            <CardDescription>Each run must include these params.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {paramSpecs.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No params required.</p>
+            ) : (
+              <ul className="space-y-2 text-xs">
+                {paramSpecs.map((spec) => (
+                  <li key={spec.name} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium">{spec.name}</span>
+                      <span className="uppercase tracking-wide">
+                        {spec.required ? "Required" : "Optional"}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {spec.type ? `Type: ${spec.type}` : "Type: any"}
+                    </div>
+                    {spec.description && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">{spec.description}</p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Required files</CardTitle>
+            <CardDescription>Ensure these resources are uploaded.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {requiredFiles.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No file requirements.</p>
+            ) : (
+              <ul className="space-y-2 text-xs">
+                {requiredFiles.map((req) => (
+                  <li key={req.pattern} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono text-sm">{req.pattern}</span>
+                      <span className="uppercase tracking-wide">
+                        {req.required ? "Required" : "Optional"}
+                      </span>
+                    </div>
+                    {req.description && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">{req.description}</p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
         </Card>
 
         <Card>
