@@ -1,6 +1,21 @@
-from fastapi import FastAPI
+from __future__ import annotations
+
+import sqlite3
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Generator
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+
+DATA_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = DATA_DIR / "tools.db"
+UPLOAD_ROOT = DATA_DIR / "uploads"
+ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
 
 class DoubleRequest(BaseModel):
@@ -24,7 +39,104 @@ class HealthResponse(BaseModel):
     message: str = Field(..., description="Additional context about the API state")
 
 
-app = FastAPI(title="Double API", version="0.1.0", summary="Simple doubling service")
+class Tool(BaseModel):
+    id: int
+    name: str
+    created_at: datetime
+
+
+class ToolFile(BaseModel):
+    id: int
+    tool_id: int
+    original_filename: str
+    stored_filename: str
+    content_type: str | None
+    size_bytes: int
+    uploaded_at: datetime
+
+
+class ToolDetail(Tool):
+    files: list[ToolFile] = Field(default_factory=list)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def init_storage() -> None:
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def init_db() -> None:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH, check_same_thread=False) as connection:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id INTEGER NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+                original_filename TEXT NOT NULL,
+                stored_filename TEXT NOT NULL,
+                content_type TEXT,
+                size_bytes INTEGER NOT NULL,
+                uploaded_at TEXT NOT NULL
+            );
+            """
+        )
+        connection.commit()
+
+
+def get_db() -> Generator[sqlite3.Connection, None, None]:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON;")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def row_to_tool(row: sqlite3.Row) -> Tool:
+    return Tool(
+        id=row["id"],
+        name=row["name"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def row_to_tool_file(row: sqlite3.Row) -> ToolFile:
+    return ToolFile(
+        id=row["id"],
+        tool_id=row["tool_id"],
+        original_filename=row["original_filename"],
+        stored_filename=row["stored_filename"],
+        content_type=row["content_type"],
+        size_bytes=row["size_bytes"],
+        uploaded_at=datetime.fromisoformat(row["uploaded_at"]),
+    )
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_storage()
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="Tool Builder API",
+    version="0.2.0",
+    summary="Manage analysis tools and their uploaded data",
+    lifespan=lifespan,
+)
+
 
 allowed_origins = [
     "http://localhost:3100",
@@ -44,7 +156,11 @@ app.add_middleware(
 def read_root() -> HealthResponse:
     """Return a basic health-check payload for quick diagnostics."""
 
-    return HealthResponse(status="ok", message="Double API is running")
+    return HealthResponse(
+        status="ok",
+        message="Tool Builder API is running",
+    )
+
 
 @app.post(
     "/api/double",
@@ -60,3 +176,136 @@ def double_number(payload: DoubleRequest) -> DoubleResponse:
         doubled=doubled_value,
         message=f"{payload.value} doubled is {doubled_value}",
     )
+
+
+@app.get("/api/tools", response_model=list[Tool], summary="List available tools")
+def list_tools(connection: sqlite3.Connection = Depends(get_db)) -> list[Tool]:
+    rows = connection.execute(
+        "SELECT id, name, created_at FROM tools ORDER BY created_at DESC"
+    ).fetchall()
+    return [row_to_tool(row) for row in rows]
+
+
+@app.post("/api/tools", response_model=Tool, summary="Create a new tool")
+def create_tool(connection: sqlite3.Connection = Depends(get_db)) -> Tool:
+    created_at = _iso(datetime.now(timezone.utc))
+    cursor = connection.execute(
+        "INSERT INTO tools (name, created_at) VALUES (?, ?)",
+        ("Untitled tool", created_at),
+    )
+    connection.commit()
+    tool_id = cursor.lastrowid
+    row = connection.execute(
+        "SELECT id, name, created_at FROM tools WHERE id = ?",
+        (tool_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Failed to load created tool")
+    return row_to_tool(row)
+
+
+@app.get(
+    "/api/tools/{tool_id}",
+    response_model=ToolDetail,
+    summary="Fetch a tool with uploaded files",
+)
+def get_tool(tool_id: int, connection: sqlite3.Connection = Depends(get_db)) -> ToolDetail:
+    tool_row = connection.execute(
+        "SELECT id, name, created_at FROM tools WHERE id = ?",
+        (tool_id,),
+    ).fetchone()
+    if tool_row is None:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    files_rows = connection.execute(
+        """
+        SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
+        FROM tool_files
+        WHERE tool_id = ?
+        ORDER BY uploaded_at DESC
+        """,
+        (tool_id,),
+    ).fetchall()
+
+    return ToolDetail(
+        **row_to_tool(tool_row).model_dump(),
+        files=[row_to_tool_file(row) for row in files_rows],
+    )
+
+
+@app.post(
+    "/api/tools/{tool_id}/files",
+    response_model=list[ToolFile],
+    summary="Upload one or more data files to a tool",
+)
+async def upload_tool_files(
+    tool_id: int,
+    files: list[UploadFile] = File(..., description="Files to attach to the tool"),
+    connection: sqlite3.Connection = Depends(get_db),
+) -> list[ToolFile]:
+    tool_exists = connection.execute(
+        "SELECT 1 FROM tools WHERE id = ?",
+        (tool_id,),
+    ).fetchone()
+    if tool_exists is None:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    saved_files: list[ToolFile] = []
+    for upload in files:
+        original_name = Path(upload.filename or "").name
+        extension = Path(original_name).suffix.lower()
+        if extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type '{extension}'. Allowed extensions: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            )
+
+        stored_filename = f"{uuid4().hex}{extension}"
+        target_dir = UPLOAD_ROOT / str(tool_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / stored_filename
+
+        contents = await upload.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        target_path.write_bytes(contents)
+        upload_ts = _iso(datetime.now(timezone.utc))
+
+        cursor = connection.execute(
+            """
+            INSERT INTO tool_files (
+                tool_id,
+                original_filename,
+                stored_filename,
+                content_type,
+                size_bytes,
+                uploaded_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tool_id,
+                original_name,
+                stored_filename,
+                upload.content_type,
+                len(contents),
+                upload_ts,
+            ),
+        )
+        file_id = cursor.lastrowid
+        connection.commit()
+
+        file_row = connection.execute(
+            """
+            SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
+            FROM tool_files
+            WHERE id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+
+        if file_row is None:
+            raise HTTPException(status_code=500, detail="Failed to load uploaded file")
+
+        saved_files.append(row_to_tool_file(file_row))
+
+    return saved_files
