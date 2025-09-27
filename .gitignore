@@ -1,0 +1,18 @@
+# macOS artifacts
+.DS_Store
+
+# Node / frontend artifacts
+frontend/node_modules/
+frontend/.react-router/
+frontend/.vite/
+
+# Python virtual environments placed in the repo root
+.venv/
+venv/
+ENV/
+
+# Environment definition files (exclude any file containing `.env`)
+.env
+.env*
+*.env
+*.env*
