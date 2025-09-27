@@ -1,30 +1,17 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from contextlib import suppress
 from string import Template
-from typing import Any, Callable, Dict, Iterable, Protocol, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, Protocol
 from uuid import uuid4
 
-from fastapi import HTTPException
+from e2b import CommandExitException, FileType
+from e2b_code_interpreter import Sandbox
 
 from .models import E2BFileInfo, E2BTestRequest, E2BTestResponse
-
-if TYPE_CHECKING:  # pragma: no cover - typing helpers only
-    from e2b_code_interpreter import Sandbox as SandboxType
-else:
-    SandboxType = Any
-
-RuntimeSandbox: SandboxType | None
-
-try:  # pragma: no cover - optional dependency resolution
-    from e2b_code_interpreter import Sandbox as RuntimeSandbox  # type: ignore
-except ImportError:  # pragma: no cover - fallback for alternate package name
-    try:
-        from e2b import CodeInterpreterSandbox as RuntimeSandbox  # type: ignore
-    except ImportError:  # pragma: no cover - handled at runtime
-        RuntimeSandbox = None  # type: ignore
 
 
 class HostAction(Protocol):
@@ -256,44 +243,32 @@ def log(message: str) -> None:
 """
 ).substitute(LOG_FILE=E2B_LOG_FILE)
 
+def _create_sandbox(allow_internet: bool) -> Sandbox:
+    return Sandbox.create(allow_internet_access=bool(allow_internet))
+    
 
-def _require_sandbox_available() -> None:
-    if RuntimeSandbox is None:  # pragma: no cover - dependent on optional installation
-        raise HTTPException(
-            status_code=500,
-            detail="E2B SDK is not installed. Install 'e2b-code-interpreter' to use this endpoint.",
-        )
-
-
-def _create_sandbox(allow_internet: bool) -> SandboxType:
-    _require_sandbox_available()
-    try:
-        return RuntimeSandbox.create(allow_internet_access=bool(allow_internet))
-    except TypeError:  # pragma: no cover - older SDK compatibility
-        return RuntimeSandbox.create(allowInternetAccess=bool(allow_internet))
-
-
-def _sandbox_mkdirs(sandbox: SandboxType, paths: Iterable[str]) -> None:
+def _sandbox_mkdirs(sandbox: Sandbox, paths: Iterable[str]) -> None:
     for path in paths:
         with suppress(Exception):
-            sandbox.files.mkdir(path)
+            sandbox.files.make_dir(path)
 
 
-def _sandbox_write_text(sandbox: SandboxType, path: str, content: str) -> None:
+def _sandbox_write_text(sandbox: Sandbox, path: str, content: str) -> None:
     sandbox.files.write(path, content)
 
 
-def _sandbox_read_bytes(sandbox: SandboxType, path: str) -> bytes:
-    return sandbox.files.read(path)
+def _sandbox_read_bytes(sandbox: Sandbox, path: str) -> bytes:
+    data = sandbox.files.read(path, format="bytes")
+    return bytes(data)
 
 
-def _sandbox_delete(sandbox: SandboxType, path: str) -> None:
+def _sandbox_delete(sandbox: Sandbox, path: str) -> None:
     with suppress(Exception):
-        sandbox.files.delete(path)
+        sandbox.files.remove(path)
 
 
 def _service_host_requests(
-    sandbox: SandboxType, host_actions: Dict[str, HostAction]
+    sandbox: Sandbox, host_actions: Dict[str, HostAction]
 ) -> None:
     try:
         entries = sandbox.files.list(E2B_REQUEST_DIR)
@@ -318,7 +293,7 @@ def _service_host_requests(
         handler = host_actions.get(action)
 
         try:
-            result = (
+            result: dict[str, Any] = (
                 handler(payload.get("payload", {}))
                 if handler
                 else {"ok": False, "error": f"unsupported_action:{action}"}
@@ -330,7 +305,7 @@ def _service_host_requests(
         _sandbox_write_text(sandbox, response_path, json.dumps(result))
 
 
-def _collect_file_info(sandbox: SandboxType, roots: Iterable[str]) -> list[E2BFileInfo]:
+def _collect_file_info(sandbox: Sandbox, roots: Iterable[str]) -> list[E2BFileInfo]:
     files: dict[str, E2BFileInfo] = {}
 
     for root in roots:
@@ -349,8 +324,8 @@ def _collect_file_info(sandbox: SandboxType, roots: Iterable[str]) -> list[E2BFi
             if path.startswith(E2B_REQUEST_DIR) or path.startswith(E2B_RESPONSE_DIR):
                 continue
 
-            entry_type = getattr(current, "type", "file")
-            if entry_type == "directory":
+            entry_type = getattr(current, "type", None)
+            if entry_type == FileType.DIR:
                 try:
                     children = sandbox.files.list(path)
                 except Exception:
@@ -422,7 +397,7 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
         _sandbox_write_text(sandbox, f"{E2B_SDK_DIR}/log.py", E2B_SDK_LOG_CODE)
         _sandbox_write_text(sandbox, E2B_USER_SCRIPT, payload.code)
 
-        config_payload = {"entrypoint": E2B_USER_SCRIPT, "params": payload.params}
+        config_payload: dict[str, Any] = {"entrypoint": E2B_USER_SCRIPT, "params": payload.params}
         _sandbox_write_text(sandbox, E2B_CONFIG_PATH, json.dumps(config_payload))
 
         _sandbox_delete(sandbox, E2B_LOG_FILE)
@@ -451,46 +426,55 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
             stdout_lines.extend(lines)
             _emit(lines)
 
-        process = sandbox.commands.run(
+        command_handle = sandbox.commands.run(
             f"python {E2B_RUNNER_PATH}",
-            wait=False,
-            on_stdout=_capture_stream,
-            on_stderr=_capture_stream,
+            background=True,
         )
         start_time = time.time()
         timeout_seconds = 90
 
         exit_error: str | None = None
+        exit_code: int | None = None
+        wait_complete = threading.Event()
+
+        def _wait_for_command() -> None:
+            nonlocal exit_error, exit_code
+            try:
+                result = command_handle.wait(
+                    on_stdout=_capture_stream,
+                    on_stderr=_capture_stream,
+                )
+                exit_code = result.exit_code
+                if result.exit_code != 0 and exit_error is None:
+                    exit_error = result.error or f"Sandbox process exited with code {result.exit_code}"
+            except CommandExitException as exc:
+                exit_code = exc.exit_code
+                if exit_error is None:
+                    exit_error = exc.error or f"Sandbox process exited with code {exc.exit_code}"
+            finally:
+                wait_complete.set()
+
+        wait_thread = threading.Thread(target=_wait_for_command, daemon=True)
+        wait_thread.start()
 
         while True:
             _service_host_requests(sandbox, host_actions)
             _read_log_updates()
 
-            finished = getattr(process, "finished", None)
-            if finished is True:
-                break
-
-            if hasattr(process, "poll") and process.poll() is not None:
+            if wait_complete.wait(timeout=0.0):
                 break
 
             if time.time() - start_time > timeout_seconds:
                 exit_error = "Sandbox execution timed out"
                 with suppress(Exception):
-                    process.stop()
+                    command_handle.kill()
                 break
 
-            if hasattr(process, "wait"):
-                try:
-                    process.wait(timeout=0.2)
-                except Exception:
-                    pass
-            else:
-                time.sleep(0.2)
-
-        with suppress(Exception):
-            process.wait()
+            wait_complete.wait(timeout=0.2)
 
         _read_log_updates()
+        wait_complete.wait(timeout=5.0)
+        wait_thread.join(timeout=5.0)
 
         if stdout_lines:
             seen = set(log_lines)
@@ -503,10 +487,8 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
 
         sandbox_id = getattr(sandbox, "sandbox_id", "unknown")
 
-        if exit_error is None and hasattr(process, "returncode"):
-            returncode = getattr(process, "returncode", 0)
-            if isinstance(returncode, int) and returncode != 0:
-                exit_error = f"Sandbox process exited with code {returncode}"
+        if exit_error is None and exit_code not in (None, 0):
+            exit_error = f"Sandbox process exited with code {exit_code}"
 
         return E2BTestResponse(
             ok=exit_error is None,
@@ -518,4 +500,4 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
     finally:
         if hasattr(sandbox, "close"):
             with suppress(Exception):
-                sandbox.close()
+                sandbox.kill()
