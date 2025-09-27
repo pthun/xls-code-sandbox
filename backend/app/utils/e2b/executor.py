@@ -463,6 +463,38 @@ def execute_e2b_test(payload: E2BTestRequest, *, log_sink: LogSink | None = None
             stdout_lines.extend(lines)
             _emit(lines)
 
+        if payload.pip_packages:
+            requirements_path = f"{E2B_IO_DIR}/requirements.txt"
+            requirements_content = "\n".join(
+                pkg.strip() for pkg in payload.pip_packages if pkg.strip()
+            )
+            if requirements_content:
+                _sandbox_write_text(sandbox, requirements_path, requirements_content)
+                try:
+                    result = sandbox.commands.run(
+                        f"pip install -r {requirements_path}",
+                        on_stdout=_capture_stream,
+                        on_stderr=_capture_stream,
+                    )
+                    if result.exit_code != 0:
+                        exit_error = result.error or (
+                            f"pip install exited with code {result.exit_code}"
+                        )
+                except CommandExitException as exc:
+                    exit_error = exc.error or (
+                        f"pip install exited with code {exc.exit_code}"
+                    )
+                if exit_error is not None:
+                    _read_log_updates()
+                    files = _collect_file_info(sandbox, [E2B_ARTIFACT_DIR, E2B_IO_DIR])
+                    return E2BTestResponse(
+                        ok=False,
+                        sandbox_id=getattr(sandbox, "sandbox_id", "unknown"),
+                        logs=log_lines + stdout_lines,
+                        files=files,
+                        error=exit_error,
+                    )
+
         command_handle = sandbox.commands.run(
             f"python {E2B_RUNNER_PATH}",
             background=True,

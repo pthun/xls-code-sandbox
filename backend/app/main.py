@@ -1,24 +1,28 @@
 from __future__ import annotations
 
-import dotenv
-dotenv.load_dotenv()
-
-import shutil
-import sqlite3
+import os
 import asyncio
 import json
+import shutil
+import sqlite3
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Literal, Sequence
 from uuid import uuid4
+
+import dotenv
 
 from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .prompts.e2b_assistant import E2B_ASSISTANT_PROMPT
 from .utils.e2b import E2BTestRequest, E2BTestResponse, execute_e2b_test
+from .utils.openai import RoleLiteral, call_openai_responses
+
+dotenv.load_dotenv()
 
 
 INSTANCE_DIR = Path(__file__).resolve().parent.parent / "instance"
@@ -70,6 +74,54 @@ class ToolDetail(Tool):
 
 class ToolUpdateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
+
+
+ChatRole = Literal["user", "assistant"]
+
+
+class ChatMessage(BaseModel):
+    role: ChatRole
+    content: str = Field(..., min_length=1)
+
+
+class ChatRequest(BaseModel):
+    messages: Sequence[ChatMessage] = Field(..., min_length=1)
+    model: str | None = Field(
+        default=None, description="Override the default OpenAI model name"
+    )
+
+
+class ChatAssistantMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+
+
+class ChatUsage(BaseModel):
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+class ChatCompletionResponse(BaseModel):
+    message: ChatAssistantMessage
+    code: str | None = None
+    pip_packages: list[str] = Field(default_factory=list)
+    usage: ChatUsage | None = None
+    raw: str | None = None
+
+
+def _usage_from_tokens(
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    total_tokens: int | None,
+) -> ChatUsage | None:
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    return ChatUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 def _iso(dt: datetime) -> str:
@@ -200,6 +252,70 @@ def run_e2b_test(payload: E2BTestRequest) -> E2BTestResponse:
     """Create a fresh E2B sandbox, seed the runner scaffolding, and execute the provided code."""
 
     return execute_e2b_test(payload)
+
+
+@app.post(
+    "/api/e2b-chat",
+    response_model=ChatCompletionResponse,
+    summary="Generate sandbox code with the OpenAI Responses API",
+)
+def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not configured on the server",
+        )
+
+    model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+    message_payload: list[tuple[RoleLiteral, str]] = []
+    for message in payload.messages:
+        content = message.content.strip()
+        if not content:
+            continue
+        role: RoleLiteral = message.role  # ChatMessage enforces valid roles
+        message_payload.append((role, content))
+
+    try:
+        (
+            _response,
+            display_text,
+            code_snippet,
+            pip_packages,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            raw_text,
+        ) = call_openai_responses(
+            api_key=api_key,
+            system_prompt=E2B_ASSISTANT_PROMPT,
+            messages=message_payload,
+            model_name=model_name,
+        )
+    except Exception as exc:  # pragma: no cover - network interaction
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    usage = _usage_from_tokens(prompt_tokens, completion_tokens, total_tokens)
+    final_text = display_text.strip()
+    if not final_text:
+        if pip_packages and code_snippet:
+            final_text = "Updated the sandbox module and pip requirements."
+        elif code_snippet:
+            final_text = "Updated the sandbox module."
+        elif pip_packages:
+            final_text = "Updated pip requirements."
+        else:
+            final_text = "No changes were proposed."
+    assistant_message = ChatAssistantMessage(content=final_text)
+
+    return ChatCompletionResponse(
+        message=assistant_message,
+        code=code_snippet,
+        pip_packages=pip_packages,
+        usage=usage,
+        raw=raw_text,
+    )
 
 
 @app.post(

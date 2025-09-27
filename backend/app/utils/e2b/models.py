@@ -17,6 +17,10 @@ class E2BTestRequest(BaseModel):
     params: Dict[str, Any] = Field(
         default_factory=dict, description="Parameters forwarded to run()"
     )
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description="Packages to install via pip before running the script",
+    )
 
 
 class E2BFileInfo(BaseModel):
