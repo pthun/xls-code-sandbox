@@ -1,36 +1,28 @@
-"""Tool that summarises XLS/XLSX spreadsheets.""" 
+"""Tool that summarises XLSX spreadsheets following the shared Result contract."""
 
 from __future__ import annotations
 
-import math
-from datetime import date, datetime
-from typing import Any, Iterable, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional
 
-from pydantic import BaseModel, Field
 from openai.types.responses import FunctionToolParam
+from pydantic import BaseModel, Field
 
 from .base import ResponseTool, ToolExecutionResult
-from .filesystem import (
-    InvalidToolFilePathError,
-    ToolFileNotFoundError,
-    ToolFileRecord,
-    ToolNotFoundError,
-    resolve_tool_file,
+from .excel_common import (
+    FormulaCounter,
+    Result,
+    resolve_workbook_record,
+    row_values_trimmed,
+    serialize_result,
+    sheet_dimension_bounds,
+    open_workbook,
+    result_from_exception,
 )
+from .filesystem import ToolFileRecord
 from .registry import registry
 
-try:  # pragma: no cover - optional dependency
-    import openpyxl  # type: ignore[import]
-except ModuleNotFoundError:  # pragma: no cover
-    openpyxl = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - optional dependency
-    import xlrd  # type: ignore[import]
-except ModuleNotFoundError:  # pragma: no cover
-    xlrd = None  # type: ignore[assignment]
-
-
-MAX_SAMPLE_ROWS = 5
+DEFAULT_MAX_SAMPLE_ROWS = 5
+MAX_SAMPLE_ROWS_CAP = 20
 
 
 class SpreadsheetFileArgs(BaseModel):
@@ -39,6 +31,16 @@ class SpreadsheetFileArgs(BaseModel):
     path: str = Field(
         ...,
         description="Path (relative to the tool uploads directory) to the spreadsheet.",
+    )
+    include_formula_count: bool = Field(
+        False,
+        description="If true, perform a second pass to count formula cells per sheet.",
+    )
+    max_sample_rows: int = Field(
+        DEFAULT_MAX_SAMPLE_ROWS,
+        ge=0,
+        le=MAX_SAMPLE_ROWS_CAP,
+        description="Maximum number of data rows to sample per sheet.",
     )
 
 
@@ -55,6 +57,7 @@ class WorksheetSummary(BaseModel):
     data_rows: int
     columns: int
     sample_rows: list[WorksheetSampleRow]
+    formula_cells: int | None = None
 
 
 class SpreadsheetSummary(BaseModel):
@@ -69,208 +72,126 @@ GET_XLS_SUMMARY_NAME = "get_xls_summary"
 GET_XLS_SUMMARY_DEFINITION = FunctionToolParam(
     type="function",
     name=GET_XLS_SUMMARY_NAME,
-    description="Summarise an XLS/XLSX file by reporting sheet counts and table shapes.",
+    description="Summarise an XLSX file by reporting sheet counts and table shapes.",
     parameters=SpreadsheetFileArgs.model_json_schema(),
     strict=False,
 )
 
 
-def _is_blank(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    if isinstance(value, str):
-        return not value.strip()
-    return False
-
-
-def _stringify(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float):
-        if math.isnan(value):
-            return ""
-        if value.is_integer():
-            return str(int(value))
-        return f"{value:g}"
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _trim_row(values: Iterable[Any]) -> list[str]:
-    material = list(values)
-    while material and _is_blank(material[-1]):
-        material.pop()
-    return [_stringify(item) for item in material]
-
-
-def _summarise_rows(rows: Iterable[Tuple[int, Iterable[Any]]]) -> tuple[list[str], int | None, int, int, int, list[WorksheetSampleRow]]:
+def _summarise_worksheet(
+    worksheet: "openpyxl.worksheet.worksheet.Worksheet",  # type: ignore[name-defined]
+    *,
+    max_sample_rows: int,
+) -> tuple[WorksheetSummary, tuple[int, int, int, int]]:
     header: list[str] = []
     header_row_number: int | None = None
     data_rows = 0
-    total_rows = 0
     max_columns = 0
     samples: list[WorksheetSampleRow] = []
 
-    for row_number, raw_values in rows:
-        trimmed = _trim_row(raw_values)
+    for row_number, raw_row in enumerate(
+        worksheet.iter_rows(values_only=True),
+        start=1,
+    ):
+        trimmed = row_values_trimmed(list(raw_row))
         if not trimmed:
             continue
-        total_rows += 1
         max_columns = max(max_columns, len(trimmed))
         if header_row_number is None:
             header = trimmed
             header_row_number = row_number
             continue
         data_rows += 1
-        if len(samples) < MAX_SAMPLE_ROWS:
+        if len(samples) < max_sample_rows:
             samples.append(WorksheetSampleRow(row_number=row_number, values=trimmed))
 
-    calculated_total_rows = data_rows + (1 if header_row_number is not None else 0)
-    # total_rows tracks non-empty rows encountered; prefer calculated value for clarity.
-    total_rows = calculated_total_rows
-    return header, header_row_number, total_rows, data_rows, max_columns, samples
-
-
-def _summarise_xlsx(record: ToolFileRecord) -> SpreadsheetSummary:
-    if openpyxl is None:
-        raise RuntimeError("openpyxl is not installed, cannot process XLSX files")
-
-    path = record.path
-    if not path.exists():
-        msg = f"File not found on disk: {path}"
-        raise ToolFileNotFoundError(msg)
-
-    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    try:
-        sheets: list[WorksheetSummary] = []
-        for worksheet in workbook.worksheets:
-            rows = (
-                (idx, tuple(cell for cell in row))
-                for idx, row in enumerate(worksheet.iter_rows(values_only=True), start=1)
-            )
-            header, header_row_number, total_rows, data_rows, max_columns, samples = _summarise_rows(rows)
-            sheets.append(
-                WorksheetSummary(
-                    name=worksheet.title,
-                    header=header,
-                    header_row_number=header_row_number,
-                    total_rows=total_rows,
-                    data_rows=data_rows,
-                    columns=max_columns,
-                    sample_rows=samples,
-                )
-            )
-    finally:
-        workbook.close()
-
-    return SpreadsheetSummary(
-        tool_id=record.tool_id,
-        path=str(path),
-        sheet_count=len(sheets),
-        sheets=sheets,
+    total_rows = data_rows + (1 if header_row_number is not None else 0)
+    summary = WorksheetSummary(
+        name=worksheet.title,
+        header=header,
+        header_row_number=header_row_number,
+        total_rows=total_rows,
+        data_rows=data_rows,
+        columns=max_columns,
+        sample_rows=samples,
     )
+    bounds = sheet_dimension_bounds(worksheet)
+    return summary, bounds
 
 
-def _convert_xls_cell(cell: "xlrd.sheet.Cell", datemode: int) -> Any:
-    if cell.ctype == xlrd.XL_CELL_EMPTY:
-        return ""
-    if cell.ctype == xlrd.XL_CELL_TEXT:
-        return cell.value
-    if cell.ctype == xlrd.XL_CELL_NUMBER:
-        return cell.value
-    if cell.ctype == xlrd.XL_CELL_DATE:
-        try:
-            dt = datetime(*xlrd.xldate_as_tuple(cell.value, datemode))
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            return cell.value
-        if dt.time() == datetime.min.time():
-            return dt.date()
-        return dt
-    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
-        return bool(cell.value)
-    if cell.ctype == xlrd.XL_CELL_ERROR:
-        return f"#ERR({cell.value})"
-    return cell.value
+def _summarise_workbook(
+    record: ToolFileRecord,
+    *,
+    include_formula_count: bool,
+    max_sample_rows: int,
+) -> SpreadsheetSummary:
+    with open_workbook(record.path, read_only=True, data_only=True) as workbook:
+        summaries: list[WorksheetSummary] = []
+        bounds_by_sheet: dict[str, tuple[int, int, int, int]] = {}
+        for worksheet in workbook.worksheets:
+            summary, bounds = _summarise_worksheet(worksheet, max_sample_rows=max_sample_rows)
+            summaries.append(summary)
+            bounds_by_sheet[summary.name] = bounds
 
-
-def _summarise_xls(record: ToolFileRecord) -> SpreadsheetSummary:
-    if xlrd is None:
-        raise RuntimeError("xlrd is not installed, cannot process XLS files")
-
-    path = record.path
-    if not path.exists():
-        msg = f"File not found on disk: {path}"
-        raise ToolFileNotFoundError(msg)
-
-    book = xlrd.open_workbook(path, on_demand=True)
-    try:
-        sheets: list[WorksheetSummary] = []
-        for sheet_name in book.sheet_names():
-            sheet = book.sheet_by_name(sheet_name)
-            rows = (
-                (
-                    row_index + 1,
-                    (_convert_xls_cell(sheet.cell(row_index, col_index), book.datemode) for col_index in range(sheet.ncols)),
-                )
-                for row_index in range(sheet.nrows)
-            )
-            header, header_row_number, total_rows, data_rows, max_columns, samples = _summarise_rows(rows)
-            sheets.append(
-                WorksheetSummary(
-                    name=sheet_name,
-                    header=header,
-                    header_row_number=header_row_number,
-                    total_rows=total_rows,
-                    data_rows=data_rows,
-                    columns=max_columns,
-                    sample_rows=samples,
-                )
-            )
-            sheet.unload()
-    finally:
-        book.release_resources()
+    if include_formula_count and summaries:
+        summary_by_name = {summary.name: summary for summary in summaries}
+        with open_workbook(record.path, read_only=True, data_only=False) as workbook:
+            for worksheet in workbook.worksheets:
+                summary = summary_by_name.get(worksheet.title)
+                if summary is None:
+                    continue
+                bounds = bounds_by_sheet.get(summary.name)
+                if bounds is None:
+                    bounds = sheet_dimension_bounds(worksheet)
+                min_row, min_col, max_row, max_col = bounds
+                counter = FormulaCounter()
+                for row in worksheet.iter_rows(
+                    min_row=min_row,
+                    max_row=max_row,
+                    min_col=min_col,
+                    max_col=max_col,
+                    values_only=True,
+                ):
+                    for value in row:
+                        counter.feed(value)
+                summary.formula_cells = counter.tally()
 
     return SpreadsheetSummary(
         tool_id=record.tool_id,
-        path=str(path),
-        sheet_count=len(sheets),
-        sheets=sheets,
+        path=str(record.path),
+        sheet_count=len(summaries),
+        sheets=summaries,
     )
 
 
 async def _execute_get_xls_summary(
-    *, tool_id: int, arguments: Optional[Mapping[str, Any]] = None
+    *,
+    tool_id: int,
+    arguments: Optional[Mapping[str, Any]] = None,
+    folder_prefix: str | None = None,
 ) -> ToolExecutionResult:
     args = SpreadsheetFileArgs.model_validate(arguments or {})
+    max_sample_rows = min(args.max_sample_rows, MAX_SAMPLE_ROWS_CAP)
 
     try:
-        record = resolve_tool_file(
-            tool_id,
-            path=args.path,
+        record = resolve_workbook_record(tool_id, args.path, folder_prefix=folder_prefix)
+        summary = _summarise_workbook(
+            record,
+            include_formula_count=args.include_formula_count,
+            max_sample_rows=max_sample_rows,
         )
-    except (ToolNotFoundError, ToolFileNotFoundError, InvalidToolFilePathError) as exc:
-        return ToolExecutionResult(success=False, output="{}", error=str(exc))
-
-    suffix = record.path.suffix.lower()
-    try:
-        if suffix == ".xlsx":
-            payload = _summarise_xlsx(record)
-        elif suffix == ".xls":
-            payload = _summarise_xls(record)
-        else:
-            raise ValueError(f"Unsupported spreadsheet format '{suffix}'.")
-    except Exception as exc:
-        return ToolExecutionResult(success=False, output="{}", error=str(exc))
-
-    return ToolExecutionResult(
-        success=True,
-        output=payload.model_dump_json(),
-    )
+        result: Result[SpreadsheetSummary] = Result[SpreadsheetSummary].ok(summary)
+        return ToolExecutionResult(
+            success=True,
+            output=serialize_result(result),
+        )
+    except Exception as exc:  # pragma: no cover - defensive umbrella
+        error_result = result_from_exception(exc)
+        return ToolExecutionResult(
+            success=False,
+            output=serialize_result(error_result),
+            error=error_result.message,
+        )
 
 
 get_xls_summary_tool = ResponseTool(

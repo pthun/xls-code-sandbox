@@ -7,13 +7,10 @@ import { API_BASE_URL } from "../config";
 import type { Route } from "./+types/_app.tools";
 
 type ToolFile = {
-  id: number;
-  tool_id: number;
-  original_filename: string;
-  stored_filename: string;
-  content_type: string | null;
+  filename: string;
+  path: string;
   size_bytes: number;
-  uploaded_at: string;
+  modified_at: string;
 };
 
 type ToolDetail = {
@@ -27,7 +24,7 @@ export type ToolLayoutContextValue = {
   tool: ToolDetail;
   revalidate: () => void;
   handleUpload: (files: File[]) => Promise<void>;
-  deleteFile: (fileId: number) => Promise<void>;
+  deleteFile: (filename: string) => Promise<void>;
   activityState: {
     isProcessing: boolean;
     error: string | null;
@@ -108,14 +105,16 @@ export default function ToolLayout() {
     }
   }
 
-  async function deleteFile(fileId: number) {
+  async function deleteFile(filename: string) {
     setIsProcessing(true);
     setStatusError(null);
     setStatusMessage(null);
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/tools/${tool.id}/files/${fileId}`,
+        `${API_BASE_URL}/api/tools/${tool.id}/files/${encodeURIComponent(
+          filename
+        )}`,
         {
           method: "DELETE",
         }
@@ -200,6 +199,19 @@ export default function ToolLayout() {
               }
             >
               Create script
+            </NavLink>
+            <NavLink
+              to="test-variations"
+              className={({ isActive }) =>
+                cn(
+                  "block rounded-md px-3 py-2 text-sm transition",
+                  isActive
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent/40"
+                )
+              }
+            >
+              Test variations
             </NavLink>
             <NavLink
               to="generate-eval-files"

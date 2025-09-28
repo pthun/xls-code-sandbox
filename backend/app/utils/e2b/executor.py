@@ -324,6 +324,53 @@ def _sandbox_delete(sandbox: Sandbox, path: str) -> None:
         sandbox.files.remove(path)
 
 
+def _seed_input_files(
+    sandbox: Sandbox,
+    entries: Iterable[tuple[str, Path]],
+) -> tuple[list[str], list[str]]:
+    """Copy host-side uploads into the sandbox input directory."""
+
+    seen: set[str] = set()
+    written: list[str] = []
+    errors: list[str] = []
+
+    for display_name, local_path in entries:
+        try:
+            if not local_path.exists():
+                errors.append(f"{display_name}: missing at {local_path}")
+                continue
+        except OSError as exc:
+            errors.append(f"{display_name}: existence check failed ({exc})")
+            continue
+
+        candidate = Path(display_name).name or local_path.name or uuid4().hex
+        stem = Path(candidate).stem or candidate
+        suffix = Path(candidate).suffix
+        final_name = candidate
+        counter = 2
+        while final_name in seen:
+            final_name = f"{stem}_{counter}{suffix}"
+            counter += 1
+
+        try:
+            data = local_path.read_bytes()
+        except Exception as exc:
+            errors.append(f"{display_name}: read failed ({exc})")
+            continue
+
+        sandbox_path = f"{E2B_INPUT_DIR}/{final_name}"
+        try:
+            sandbox.files.write(sandbox_path, data)  # type: ignore[reportUnknownMemberType]
+        except Exception as exc:
+            errors.append(f"{display_name}: write failed ({exc})")
+            continue
+
+        seen.add(final_name)
+        written.append(sandbox_path)
+
+    return written, errors
+
+
 def _ping_action(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "pong": payload}
 
@@ -433,8 +480,9 @@ def execute_e2b_test(
     run_id: str | None = None,
     persist_root: Path | None = None,
     code_version: int,
+    input_files: Iterable[tuple[str, Path]] | None = None,
 ) -> SandboxExecutionResult:
-    """Spin up a sandbox, run the supplied code, and optionally persist artefacts."""
+    """Spin up a sandbox, seed optional inputs, run the code, and persist artefacts."""
 
     sandbox = _create_sandbox(payload.allow_internet)
     host_actions: Dict[str, HostAction] = {
@@ -475,6 +523,21 @@ def execute_e2b_test(
         _sandbox_write_text(sandbox, f"{E2B_SDK_DIR}/io.py", E2B_SDK_IO_CODE)
         _sandbox_write_text(sandbox, f"{E2B_SDK_DIR}/log.py", E2B_SDK_LOG_CODE)
         _sandbox_write_text(sandbox, E2B_USER_SCRIPT, payload.code)
+
+        seeded_files: list[str] = []
+        seed_errors: list[str] = []
+        if input_files:
+            entries = list(input_files)
+            if entries:
+                seeded_files, seed_errors = _seed_input_files(sandbox, entries)
+        if seeded_files:
+            _emit([f"[host] seeded {len(seeded_files)} input file(s)"])
+            for path in seeded_files:
+                _emit([f"[host]  - {path}"])
+        if seed_errors:
+            _emit(["[host] input seeding issues detected"])
+            for error in seed_errors:
+                _emit([f"[host]  ! {error}"])
 
         config_payload: dict[str, Any] = {"entrypoint": E2B_USER_SCRIPT, "params": payload.params}
         _sandbox_write_text(sandbox, E2B_CONFIG_PATH, json.dumps(config_payload))

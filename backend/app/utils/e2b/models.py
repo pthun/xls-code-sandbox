@@ -25,6 +25,10 @@ class E2BTestRequest(BaseModel):
         default=None,
         description="Identifier of the code version associated with this run",
     )
+    folder_prefix: str | None = Field(
+        default=None,
+        description="Optional storage prefix that determines which files are bundled",
+    )
 
 
 class E2BFileInfo(BaseModel):

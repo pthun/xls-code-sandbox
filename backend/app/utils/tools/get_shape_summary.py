@@ -110,7 +110,10 @@ def _summarise_csv(record: ToolFileRecord) -> CsvShapeSummary:
 
 
 async def _execute_get_shape_summary(
-    *, tool_id: int, arguments: Optional[Mapping[str, Any]] = None
+    *,
+    tool_id: int,
+    arguments: Optional[Mapping[str, Any]] = None,
+    folder_prefix: str | None = None,
 ) -> ToolExecutionResult:
     args = CsvFileArgs.model_validate(arguments or {})
 
@@ -118,6 +121,7 @@ async def _execute_get_shape_summary(
         record = resolve_tool_file(
             tool_id,
             path=args.path,
+            folder_prefix=folder_prefix,
         )
     except ToolNotFoundError as exc:
         return ToolExecutionResult(success=False, output="{}", error=str(exc))

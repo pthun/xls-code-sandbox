@@ -37,6 +37,23 @@ from .utils.openai import (
     call_openai_responses,
 )
 from .utils.tools import ResponseTool, registry as tool_registry
+from .utils.tools.filesystem import (
+    DEFAULT_FOLDER_PREFIX,
+    VARIATION_METADATA_FILENAME,
+    VARIATION_PREFIX,
+    VariationFileEntry,
+    InvalidFolderPrefixError,
+    InvalidToolFilePathError,
+    VariationNotFoundError,
+    VariationRecord,
+    create_variation_snapshot,
+    get_variation_record,
+    list_tool_files,
+    list_variations,
+    normalize_folder_prefix,
+    normalize_tool_path,
+    resolve_storage_root,
+)
 from .utils.misc.typeguards import is_any_list
 
 dotenv.load_dotenv()
@@ -87,13 +104,10 @@ class Tool(BaseModel):
 
 
 class ToolFile(BaseModel):
-    id: int
-    tool_id: int
-    original_filename: str
-    stored_filename: str
-    content_type: str | None
+    filename: str
+    path: str
     size_bytes: int
-    uploaded_at: datetime
+    modified_at: datetime
 
 
 class ToolDetail(Tool):
@@ -117,6 +131,12 @@ class ChatRequest(BaseModel):
     model: str | None = Field(
         default=None, description="Override the default OpenAI model name"
     )
+    folder_prefix: str | None = Field(
+        default=DEFAULT_FOLDER_PREFIX,
+        description=(
+            "Storage namespace to expose to the assistant (e.g. 'uploads' or 'variation/0001')."
+        ),
+    )
 
 
 class ChatHistoryUpdateRequest(BaseModel):
@@ -137,6 +157,26 @@ class StoredChatMessage(BaseModel):
 class ChatAssistantMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: str
+
+
+class VariationFilePayload(BaseModel):
+    filename: str
+    path: str
+    size_bytes: int
+    modified_at: datetime
+
+
+class VariationResponse(BaseModel):
+    id: str
+    tool_id: int
+    label: str | None
+    created_at: datetime
+    prefix: str
+    files: list[VariationFilePayload] = Field(default_factory=list)
+
+
+class VariationCreateRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=200)
 
 
 class ChatUsage(BaseModel):
@@ -429,20 +469,99 @@ def _param_matches_type(value: Any, expected: str) -> bool:
     return True
 
 
-def _glob_required_files(pattern: str) -> list[Path]:
+def _glob_required_files(pattern: str, *, base_dir: Path | None = None) -> list[Path]:
     if not pattern:
         return []
+
     candidate = Path(pattern)
     if candidate.is_absolute():
         return [candidate] if candidate.exists() else []
-    if not UPLOAD_ROOT.exists():
-        return []
-    if "/" in pattern or pattern.startswith("**"):
-        return list(UPLOAD_ROOT.glob(pattern))
-    return list(UPLOAD_ROOT.rglob(pattern))
+
+    search_roots: list[Path] = []
+    if base_dir is not None:
+        search_roots.append(base_dir)
+    else:
+        search_roots.append(UPLOAD_ROOT)
+
+    matches: list[Path] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        if "/" in pattern or pattern.startswith("**"):
+            matches.extend(root.glob(pattern))
+        else:
+            matches.extend(root.rglob(pattern))
+
+    # Deduplicate while preserving order
+    seen: set[Path] = set()
+    unique_matches: list[Path] = []
+    for path in matches:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_matches.append(resolved)
+
+    return unique_matches
 
 
-def _validate_run_inputs(payload: E2BTestRequest, detail: CodeVersionDetail) -> None:
+def _canonical_folder_prefix(folder_prefix: str | None) -> str:
+    """Return the normalized storage prefix or raise an HTTP error if invalid."""
+
+    try:
+        kind, variation_id = normalize_folder_prefix(folder_prefix)
+    except InvalidFolderPrefixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if kind == DEFAULT_FOLDER_PREFIX:
+        return DEFAULT_FOLDER_PREFIX
+
+    if variation_id is None:
+        raise HTTPException(status_code=400, detail="Variation identifier is required")
+
+    return f"{VARIATION_PREFIX}/{variation_id}"
+
+
+def _collect_input_files(tool_id: int, folder_prefix: str) -> list[tuple[str, Path]]:
+    """Resolve file tuples to seed into the sandbox for a given storage prefix."""
+
+    kind, variation_id = normalize_folder_prefix(folder_prefix)
+
+    if kind == DEFAULT_FOLDER_PREFIX:
+        records = list_tool_files(tool_id)
+        return [
+            (record.original_filename, record.path)
+            for record in records
+            if record.path.is_file()
+        ]
+
+    if kind == VARIATION_PREFIX and variation_id is not None:
+        try:
+            variation = get_variation_record(tool_id, variation_id)
+        except VariationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        inputs: list[tuple[str, Path]] = []
+        for entry in variation.files:
+            candidate = (variation.path / entry.stored_filename).resolve()
+            if not candidate.is_file():
+                continue
+            inputs.append((entry.original_filename, candidate))
+        return inputs
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported folder prefix '{folder_prefix}'",
+    )
+
+
+def _validate_run_inputs(
+    payload: E2BTestRequest,
+    detail: CodeVersionDetail,
+    *,
+    tool_id: int,
+    folder_prefix: str,
+) -> None:
     params = payload.params or {}
     missing_params: list[str] = []
     invalid_params: list[dict[str, str]] = []
@@ -461,10 +580,15 @@ def _validate_run_inputs(payload: E2BTestRequest, detail: CodeVersionDetail) -> 
                 )
 
     missing_files: list[str] = []
+    try:
+        base_dir = resolve_storage_root(tool_id, folder_prefix)
+    except VariationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     for requirement in detail.required_files:
         if not requirement.required:
             continue
-        matches = _glob_required_files(requirement.pattern)
+        matches = _glob_required_files(requirement.pattern, base_dir=base_dir)
         if not matches:
             missing_files.append(requirement.pattern)
 
@@ -657,6 +781,7 @@ def _save_run_record(
     logs_path: Path,
     code_version_label: int,
     code_version_id: int | None,
+    folder_prefix: str,
 ) -> None:
     params_json = json.dumps(payload.params)
     pip_json = json.dumps(payload.pip_packages)
@@ -689,8 +814,9 @@ def _save_run_record(
                     allow_internet,
                     ok,
                     error,
-                    logs_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    logs_path,
+                    folder_prefix
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -703,6 +829,7 @@ def _save_run_record(
                     ok_value,
                     error_text,
                     logs_relative,
+                    folder_prefix,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -778,8 +905,11 @@ def _finalize_run_record(
         "allow_internet": payload.allow_internet,
         "response": execution.response.model_dump(),
         "code_version": execution.code_version,
+        "folder_prefix": payload.folder_prefix or DEFAULT_FOLDER_PREFIX,
     }
     _write_run_metadata(run_dir, metadata)
+
+    folder_prefix = payload.folder_prefix or DEFAULT_FOLDER_PREFIX
 
     _save_run_record(
         tool_id=tool_id,
@@ -794,6 +924,7 @@ def _finalize_run_record(
         code_version_id=execution.code_version_id
         if execution.code_version_id is not None
         else execution.code_version,
+        folder_prefix=folder_prefix,
     )
 
 
@@ -804,23 +935,28 @@ def _execute_run(
     run_id: str,
     log_sink: LogSinkFn | None = None,
 ) -> SandboxExecutionResult:
+    folder_prefix = _canonical_folder_prefix(payload.folder_prefix)
+    payload.folder_prefix = folder_prefix  # ensure downstream consumers see the canonical value
     version_detail = _resolve_code_version_detail(tool_id, payload)
     code_version_label = version_detail.version
     code_version_id = version_detail.record_id
     logger.info(
-        "Executing run %s for tool %s using code_version=%s (requested=%s)",
+        "Executing run %s for tool %s using code_version=%s (requested=%s, prefix=%s)",
         run_id,
         tool_id,
         code_version_label,
         payload.code_version,
+        folder_prefix,
     )
-    _validate_run_inputs(payload, version_detail)
+    _validate_run_inputs(payload, version_detail, tool_id=tool_id, folder_prefix=folder_prefix)
+    sandbox_inputs = _collect_input_files(tool_id, folder_prefix)
     execution = execute_e2b_test(
         payload,
         log_sink=log_sink,
         run_id=run_id,
         persist_root=RUNS_ROOT,
         code_version=code_version_label,
+        input_files=sandbox_inputs,
     )
     if execution.response.run_id is None:
         execution.response.run_id = run_id
@@ -842,6 +978,7 @@ class RunSummaryResponse(BaseModel):
     ok: bool | None
     error: str | None
     code_version: int
+    folder_prefix: str | None = None
 
 
 class RunDetailResponse(RunSummaryResponse):
@@ -945,16 +1082,6 @@ def init_db() -> None:
                 required_files TEXT NOT NULL DEFAULT '[]'
             );
 
-            CREATE TABLE IF NOT EXISTS tool_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tool_id INTEGER NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
-                original_filename TEXT NOT NULL,
-                stored_filename TEXT NOT NULL,
-                content_type TEXT,
-                size_bytes INTEGER NOT NULL,
-                uploaded_at TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS e2b_runs (
                 id TEXT PRIMARY KEY,
                 tool_id INTEGER REFERENCES tools(id) ON DELETE CASCADE,
@@ -1013,6 +1140,16 @@ def init_db() -> None:
             "e2b_runs",
             "tool_id",
             "INTEGER REFERENCES tools(id) ON DELETE CASCADE",
+        )
+        _ensure_column(
+            "e2b_runs",
+            "folder_prefix",
+            "TEXT",
+        )
+
+        connection.execute(
+            "UPDATE e2b_runs SET folder_prefix = ? WHERE folder_prefix IS NULL",
+            (DEFAULT_FOLDER_PREFIX,),
         )
 
         connection.execute(
@@ -1085,18 +1222,6 @@ def row_to_tool(row: sqlite3.Row) -> Tool:
         id=row["id"],
         name=row["name"],
         created_at=datetime.fromisoformat(row["created_at"]),
-    )
-
-
-def row_to_tool_file(row: sqlite3.Row) -> ToolFile:
-    return ToolFile(
-        id=row["id"],
-        tool_id=row["tool_id"],
-        original_filename=row["original_filename"],
-        stored_filename=row["stored_filename"],
-        content_type=row["content_type"],
-        size_bytes=row["size_bytes"],
-        uploaded_at=datetime.fromisoformat(row["uploaded_at"]),
     )
 
 
@@ -1235,6 +1360,7 @@ async def run_tool_test() -> ToolTestPayload:
             messages=messages,
             model_name=model_name,
             tool_names=[tool.name],
+            folder_prefix=DEFAULT_FOLDER_PREFIX,
         )
     except Exception as exc:  # pragma: no cover - network interaction
         logger.exception("OpenAI tool test failed", exc_info=exc)
@@ -1306,6 +1432,8 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
         role = message.role  # ChatMessage enforces valid roles
         message_payload.append({ "role": role, "content": content })
 
+    folder_prefix = payload.folder_prefix or DEFAULT_FOLDER_PREFIX
+
     available_tools = list(tool_registry.values())
     tool_names = [tool.name for tool in available_tools]
     tool_descriptors = [_tool_descriptor(tool) for tool in available_tools]
@@ -1333,6 +1461,7 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
             messages=message_payload,
             model_name=model_name,
             tool_names=tool_names,
+            folder_prefix=folder_prefix,
         )
     except Exception as exc:  # pragma: no cover - network interaction
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1432,6 +1561,8 @@ async def chat_generate_eval_files(
             continue
         message_payload.append({"role": message.role, "content": content})
 
+    folder_prefix = payload.folder_prefix or DEFAULT_FOLDER_PREFIX
+
     available_tools = list(tool_registry.values())
     tool_descriptors = [_tool_descriptor(tool) for tool in available_tools]
     tool_names = [tool.name for tool in available_tools]
@@ -1460,6 +1591,7 @@ async def chat_generate_eval_files(
             model_name=model_name,
             tool_names=tool_names,
             parse_structured_tags=False,
+            folder_prefix=folder_prefix,
         )
     except Exception as exc:  # pragma: no cover - network interaction
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1695,19 +1827,28 @@ async def run_e2b_test_stream(tool_id: int, payload: E2BTestRequest) -> Streamin
 )
 def list_e2b_runs(
     tool_id: int,
+    folder_prefix: str | None = Query(None, description="Optional storage prefix filter"),
     connection: sqlite3.Connection = Depends(get_db),
 ) -> list[RunSummaryResponse]:
     _ensure_tool_exists(tool_id, connection)
-    rows = connection.execute(
-        """
-        SELECT r.id, r.created_at, r.ok, r.error, v.tool_version
-        FROM e2b_runs AS r
-        JOIN code_versions AS v ON r.code_version = v.version
-        WHERE r.tool_id = ?
-        ORDER BY r.created_at DESC
-        """,
-        (tool_id,),
-    ).fetchall()
+
+    canonical_filter: str | None = None
+    if folder_prefix is not None:
+        canonical_filter = _canonical_folder_prefix(folder_prefix)
+
+    query = (
+        "SELECT r.id, r.created_at, r.ok, r.error, v.tool_version, r.folder_prefix "
+        "FROM e2b_runs AS r "
+        "JOIN code_versions AS v ON r.code_version = v.version "
+        "WHERE r.tool_id = ?"
+    )
+    params: list[object] = [tool_id]
+    if canonical_filter is not None:
+        query += " AND COALESCE(r.folder_prefix, ?) = ?"
+        params.extend([DEFAULT_FOLDER_PREFIX, canonical_filter])
+    query += " ORDER BY r.created_at DESC"
+
+    rows = connection.execute(query, params).fetchall()
 
     summaries: list[RunSummaryResponse] = []
     for row in rows:
@@ -1718,6 +1859,7 @@ def list_e2b_runs(
         if tool_version_value is None:
             continue
         code_version_label = int(tool_version_value)
+        folder_value = row["folder_prefix"]
         summaries.append(
             RunSummaryResponse(
                 id=row["id"],
@@ -1725,6 +1867,7 @@ def list_e2b_runs(
                 ok=ok_bool,
                 error=row["error"],
                 code_version=code_version_label,
+                folder_prefix=folder_value if folder_value is not None else DEFAULT_FOLDER_PREFIX,
             )
         )
     return summaries
@@ -1753,6 +1896,7 @@ def get_e2b_run(
             r.ok,
             r.error,
             r.logs_path,
+            r.folder_prefix,
             v.tool_version
         FROM e2b_runs AS r
         JOIN code_versions AS v ON r.code_version = v.version
@@ -1776,6 +1920,7 @@ def get_e2b_run(
         raise HTTPException(status_code=404, detail="Associated code version not found")
     code_version = int(tool_version_value)
     code_detail = _get_code_version_detail(tool_id, code_version)
+    folder_prefix = run_row["folder_prefix"] or DEFAULT_FOLDER_PREFIX
 
     run_dir = RUNS_ROOT / run_id
     logs_relative = run_row["logs_path"] or "logs.txt"
@@ -1822,6 +1967,7 @@ def get_e2b_run(
         logs=logs,
         files=files,
         code_version=code_version,
+        folder_prefix=folder_prefix,
     )
 
 
@@ -1993,19 +2139,17 @@ def get_tool(tool_id: int, connection: sqlite3.Connection = Depends(get_db)) -> 
     if tool_row is None:
         raise HTTPException(status_code=404, detail="Tool not found")
 
-    files_rows = connection.execute(
-        """
-        SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
-        FROM tool_files
-        WHERE tool_id = ?
-        ORDER BY uploaded_at DESC
-        """,
-        (tool_id,),
-    ).fetchall()
-
     return ToolDetail(
         **row_to_tool(tool_row).model_dump(),
-        files=[row_to_tool_file(row) for row in files_rows],
+        files=[
+            ToolFile(
+                filename=record.original_filename,
+                path=record.original_filename,
+                size_bytes=record.size_bytes,
+                modified_at=record.uploaded_at,
+            )
+            for record in list_tool_files(tool_id)
+        ],
     )
 
 
@@ -2026,99 +2170,99 @@ async def upload_tool_files(
     if tool_exists is None:
         raise HTTPException(status_code=404, detail="Tool not found")
 
+    target_dir = resolve_storage_root(tool_id, DEFAULT_FOLDER_PREFIX, create=True)
     saved_files: list[ToolFile] = []
+
     for upload in files:
         original_name = Path(upload.filename or "").name
         extension = Path(original_name).suffix.lower()
         if extension not in ALLOWED_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type '{extension}'. Allowed extensions: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+                detail=(
+                    f"Unsupported file type '{extension}'. Allowed extensions: "
+                    f"{', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                ),
             )
-
-        stored_filename = f"{uuid4().hex}{extension}"
-        target_dir = UPLOAD_ROOT / str(tool_id)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / stored_filename
 
         contents = await upload.read()
         if not contents:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
         validate_upload_contents(extension, contents)
+
+        target_path = target_dir / original_name
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(contents)
-        upload_ts = _iso(datetime.now(timezone.utc))
 
-        cursor = connection.execute(
-            """
-            INSERT INTO tool_files (
-                tool_id,
-                original_filename,
-                stored_filename,
-                content_type,
-                size_bytes,
-                uploaded_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                tool_id,
-                original_name,
-                stored_filename,
-                upload.content_type,
-                len(contents),
-                upload_ts,
-            ),
+        stat = target_path.stat()
+        saved_files.append(
+            ToolFile(
+                filename=original_name,
+                path=original_name,
+                size_bytes=stat.st_size,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+            )
         )
-        file_id = cursor.lastrowid
-        connection.commit()
-
-        file_row = connection.execute(
-            """
-            SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
-            FROM tool_files
-            WHERE id = ?
-            """,
-            (file_id,),
-        ).fetchone()
-
-        if file_row is None:
-            raise HTTPException(status_code=500, detail="Failed to load uploaded file")
-
-        saved_files.append(row_to_tool_file(file_row))
 
     return saved_files
 
 
 @app.delete(
-    "/api/tools/{tool_id}/files/{file_id}",
+    "/api/tools/{tool_id}/files/{filename:path}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Remove a file from a tool",
 )
 def delete_tool_file(
     tool_id: int,
-    file_id: int,
+    filename: str,
     connection: sqlite3.Connection = Depends(get_db),
 ) -> Response:
-    file_row = connection.execute(
-        """
-        SELECT id, stored_filename
-        FROM tool_files
-        WHERE id = ? AND tool_id = ?
-        """,
-        (file_id, tool_id),
+    tool_exists = connection.execute(
+        "SELECT 1 FROM tools WHERE id = ?",
+        (tool_id,),
     ).fetchone()
+    if tool_exists is None:
+        raise HTTPException(status_code=404, detail="Tool not found")
 
-    if file_row is None:
+    try:
+        target_path = normalize_tool_path(tool_id, filename)
+    except InvalidToolFilePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not target_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    connection.execute("DELETE FROM tool_files WHERE id = ?", (file_id,))
-    connection.commit()
-
-    stored_filename = file_row["stored_filename"]
-    file_path = UPLOAD_ROOT / str(tool_id) / stored_filename
     with suppress(FileNotFoundError):
-        file_path.unlink()
+        target_path.unlink()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get(
+    "/api/tools/{tool_id}/variations",
+    response_model=list[VariationResponse],
+    summary="List variation workspaces for a tool",
+)
+def list_tool_variations_endpoint(tool_id: int) -> list[VariationResponse]:
+    _ensure_tool_exists(tool_id)
+    records = list_variations(tool_id)
+    return [_variation_to_response(record) for record in records]
+
+
+@app.post(
+    "/api/tools/{tool_id}/variations",
+    response_model=VariationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a variation workspace by cloning current uploads",
+)
+def create_tool_variation_endpoint(
+    tool_id: int, payload: VariationCreateRequest
+) -> VariationResponse:
+    _ensure_tool_exists(tool_id)
+    record = create_variation_snapshot(tool_id, label=payload.label)
+    return _variation_to_response(record)
+
 try:
     import openpyxl  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover
@@ -2128,6 +2272,67 @@ try:
     import xlrd  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover
     xlrd = None
+
+
+def _variation_file_payload(
+    record: VariationRecord,
+    entry: VariationFileEntry,
+) -> VariationFilePayload:
+    path = record.path / entry.stored_filename
+    size_bytes = entry.size_bytes
+    modified_at = entry.uploaded_at
+    if path.exists():
+        stat = path.stat()
+        size_bytes = stat.st_size
+        modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+    if modified_at.tzinfo is None:
+        modified_at = modified_at.replace(tzinfo=timezone.utc)
+    return VariationFilePayload(
+        filename=entry.original_filename,
+        path=entry.original_filename,
+        size_bytes=size_bytes,
+        modified_at=modified_at.astimezone(timezone.utc),
+    )
+
+
+def _variation_to_response(record: VariationRecord) -> VariationResponse:
+    files: list[VariationFilePayload] = []
+    seen: set[str] = set()
+    for entry in record.files:
+        files.append(_variation_file_payload(record, entry))
+        seen.add(entry.stored_filename)
+
+    try:
+        children = list(record.path.iterdir())
+    except FileNotFoundError:
+        children = []
+
+    for child in children:
+        if child.is_dir() or child.name == VARIATION_METADATA_FILENAME:
+            continue
+        if child.name in seen:
+            continue
+        stat = child.stat()
+        modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        files.append(
+            VariationFilePayload(
+                filename=child.name,
+                path=child.name,
+                size_bytes=stat.st_size,
+                modified_at=modified_at,
+            )
+        )
+
+    files.sort(key=lambda item: item.filename.lower())
+
+    return VariationResponse(
+        id=record.id,
+        tool_id=record.tool_id,
+        label=record.label,
+        created_at=record.created_at.astimezone(timezone.utc),
+        prefix=f"{VARIATION_PREFIX}/{record.id}",
+        files=files,
+    )
 def _tool_descriptor(tool: ResponseTool) -> tuple[str, str | None]:
     """Return a human-friendly (name, description) pair for a registered tool."""
 

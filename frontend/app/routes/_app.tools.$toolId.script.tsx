@@ -1601,19 +1601,19 @@ export default function CreateScriptView() {
               <ul className="space-y-2 text-sm">
                 {tool.files.map((file) => (
                   <li
-                    key={file.id}
+                    key={file.path}
                     className="rounded-md border border-border bg-muted/20 px-3 py-2"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="truncate font-medium" title={file.original_filename}>
-                        {file.original_filename}
+                      <span className="truncate font-medium" title={file.filename}>
+                        {file.filename}
                       </span>
                       <span className="text-xs text-muted-foreground">
                         {formatBytes(file.size_bytes)}
                       </span>
                     </div>
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      Uploaded {new Date(file.uploaded_at).toLocaleString()}
+                      Updated {new Date(file.modified_at).toLocaleString()}
                     </p>
                   </li>
                 ))}

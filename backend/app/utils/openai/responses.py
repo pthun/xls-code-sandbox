@@ -31,6 +31,7 @@ async def call_openai_responses(
     tool_names: list[str] | None = None,
     max_tool_iterations: int = 3,
     parse_structured_tags: bool = True,
+    folder_prefix: str | None = None,
 ) -> tuple[
     Response,
     str,
@@ -107,7 +108,11 @@ async def call_openai_responses(
             arguments_raw = call.arguments
             arguments = json.loads(arguments_raw)
 
-            execution = await tool.invoke(tool_id=tool_id, arguments=arguments)
+            execution = await tool.invoke(
+                tool_id=tool_id,
+                arguments=arguments,
+                folder_prefix=folder_prefix,
+            )
             if not execution.success:
                 print(f"Tool '{tool.name}' execution failed: {execution.error}")
 

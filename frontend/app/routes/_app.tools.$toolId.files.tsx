@@ -97,26 +97,26 @@ export default function ToolFilesView() {
           <ul className="space-y-2">
             {tool.files.map((file) => (
               <li
-                key={file.id}
+                key={file.path}
                 className="flex flex-col gap-2 rounded-md border border-border px-4 py-3 md:flex-row md:items-center md:justify-between"
               >
                 <div>
-                  <p className="text-sm font-medium">{file.original_filename}</p>
+                  <p className="text-sm font-medium">{file.filename}</p>
                   <p className="text-xs text-muted-foreground">
-                    Uploaded {new Date(file.uploaded_at).toLocaleString()}
+                    Updated {new Date(file.modified_at).toLocaleString()}
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
                   <div className="flex flex-col text-xs text-muted-foreground md:items-end">
-                    {file.content_type && <span>{file.content_type}</span>}
-                    <span className="font-mono">{file.stored_filename}</span>
+                    <span className="font-mono">{file.path}</span>
+                    <span>{Math.max(1, Math.round(file.size_bytes / 1024))} KB</span>
                   </div>
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon"
-                    onClick={() => deleteFile(file.id)}
-                    aria-label={`Remove ${file.original_filename}`}
+                    onClick={() => deleteFile(file.filename)}
+                    aria-label={`Remove ${file.filename}`}
                   >
                     <Trash2 className="size-4" />
                   </Button>

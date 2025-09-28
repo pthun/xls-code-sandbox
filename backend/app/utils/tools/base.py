@@ -18,6 +18,7 @@ class ToolExecutor(Protocol):
         *,
         tool_id: int,
         arguments: dict[str, Any] | None = None,
+        folder_prefix: str | None = None,
     ) -> "ToolExecutionResult":
         """Execute the tool with optional arguments and return a structured result."""
 
@@ -42,11 +43,16 @@ class ResponseTool:
         *,
         tool_id: int,
         arguments: dict[str, Any] | None = None,
+        folder_prefix: str | None = None,
     ) -> ToolExecutionResult:
         """Execute the tool and return the captured result."""
 
         payload = arguments or {}
-        result = await self.executor(tool_id=tool_id, arguments=payload)
+        result = await self.executor(
+            tool_id=tool_id,
+            arguments=payload,
+            folder_prefix=folder_prefix,
+        )
         return result
 
     def as_param(self) -> FunctionToolParam:
