@@ -115,7 +115,7 @@ export default function ToolFilesView() {
                     type="button"
                     variant="ghost"
                     size="icon"
-                    onClick={() => deleteFile(file.filename)}
+                    onClick={() => deleteFile(file.path)}
                     aria-label={`Remove ${file.filename}`}
                   >
                     <Trash2 className="size-4" />

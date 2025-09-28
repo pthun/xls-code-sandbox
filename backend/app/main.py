@@ -36,7 +36,12 @@ from .utils.e2b import (
 from .utils.openai import (
     call_openai_responses,
 )
-from .utils.tools import ResponseTool, registry as tool_registry
+from .utils.tools import (
+    EDIT_TOOL_NAMES,
+    READ_ONLY_TOOL_NAMES,
+    ResponseTool,
+    registry as tool_registry,
+)
 from .utils.tools.filesystem import (
     DEFAULT_FOLDER_PREFIX,
     VARIATION_METADATA_FILENAME,
@@ -172,7 +177,7 @@ class VariationResponse(BaseModel):
     label: str | None
     created_at: datetime
     prefix: str
-    files: list[VariationFilePayload] = Field(default_factory=list)
+    files: list[VariationFilePayload] = Field(default_factory=lambda: [])
 
 
 class VariationCreateRequest(BaseModel):
@@ -1336,7 +1341,7 @@ async def run_tool_test() -> ToolTestPayload:
         },
     ]
 
-    model_name = os.getenv("OPENAI_TOOL_TEST_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+    model_name = os.getenv("OPENAI_TOOL_TEST_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1"))
 
     try:
         (
@@ -1422,7 +1427,7 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
         )
 
     _ensure_tool_exists(tool_id)
-    model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1")
 
     message_payload: list[ResponseInputItemParam] = []
     for message in payload.messages:
@@ -1434,8 +1439,11 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
 
     folder_prefix = payload.folder_prefix or DEFAULT_FOLDER_PREFIX
 
-    available_tools = list(tool_registry.values())
-    tool_names = [tool.name for tool in available_tools]
+    try:
+        tool_names = _tool_names_for_prefix(folder_prefix)
+    except InvalidFolderPrefixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    available_tools = tool_registry.get_many(tool_names)
     tool_descriptors = [_tool_descriptor(tool) for tool in available_tools]
     system_prompt = build_e2b_assistant_prompt(tool_descriptors)
 
@@ -1552,7 +1560,7 @@ async def chat_generate_eval_files(
         )
 
     _ensure_tool_exists(tool_id)
-    model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1")
 
     message_payload: list[ResponseInputItemParam] = []
     for message in payload.messages:
@@ -1563,9 +1571,12 @@ async def chat_generate_eval_files(
 
     folder_prefix = payload.folder_prefix or DEFAULT_FOLDER_PREFIX
 
-    available_tools = list(tool_registry.values())
+    try:
+        tool_names = _tool_names_for_prefix(folder_prefix)
+    except InvalidFolderPrefixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    available_tools = tool_registry.get_many(tool_names)
     tool_descriptors = [_tool_descriptor(tool) for tool in available_tools]
-    tool_names = [tool.name for tool in available_tools]
     system_prompt = build_eval_file_prompt(tool_descriptors)
 
     try:
@@ -2278,9 +2289,9 @@ def _variation_file_payload(
     record: VariationRecord,
     entry: VariationFileEntry,
 ) -> VariationFilePayload:
-    path = record.path / entry.stored_filename
+    path = (record.path / entry.stored_filename).resolve()
     size_bytes = entry.size_bytes
-    modified_at = entry.uploaded_at
+    modified_at = entry.uploaded_at or record.created_at
     if path.exists():
         stat = path.stat()
         size_bytes = stat.st_size
@@ -2289,7 +2300,7 @@ def _variation_file_payload(
         modified_at = modified_at.replace(tzinfo=timezone.utc)
     return VariationFilePayload(
         filename=entry.original_filename,
-        path=entry.original_filename,
+        path=entry.stored_filename,
         size_bytes=size_bytes,
         modified_at=modified_at.astimezone(timezone.utc),
     )
@@ -2299,31 +2310,28 @@ def _variation_to_response(record: VariationRecord) -> VariationResponse:
     files: list[VariationFilePayload] = []
     seen: set[str] = set()
     for entry in record.files:
-        files.append(_variation_file_payload(record, entry))
-        seen.add(entry.stored_filename)
+        payload = _variation_file_payload(record, entry)
+        files.append(payload)
+        seen.add(payload.path)
 
-    try:
-        children = list(record.path.iterdir())
-    except FileNotFoundError:
-        children = []
-
-    for child in children:
+    for child in record.path.rglob("*"):
         if child.is_dir() or child.name == VARIATION_METADATA_FILENAME:
             continue
-        if child.name in seen:
+        rel_path = child.relative_to(record.path).as_posix()
+        if rel_path in seen:
             continue
         stat = child.stat()
-        modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
         files.append(
             VariationFilePayload(
                 filename=child.name,
-                path=child.name,
+                path=rel_path,
                 size_bytes=stat.st_size,
-                modified_at=modified_at,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
             )
         )
+        seen.add(rel_path)
 
-    files.sort(key=lambda item: item.filename.lower())
+    files.sort(key=lambda item: item.path.lower())
 
     return VariationResponse(
         id=record.id,
@@ -2348,3 +2356,11 @@ def _tool_descriptor(tool: ResponseTool) -> tuple[str, str | None]:
     if description is not None:
         description = str(description)
     return tool.name, description
+
+
+def _tool_names_for_prefix(folder_prefix: str | None) -> list[str]:
+    kind, _variation_id = normalize_folder_prefix(folder_prefix)
+    names = set(READ_ONLY_TOOL_NAMES)
+    if kind == VARIATION_PREFIX:
+        names |= set(EDIT_TOOL_NAMES)
+    return sorted(names)

@@ -22,6 +22,35 @@ from .convert_range_to_table import convert_range_to_table_tool
 from .append_rows_to_table import append_rows_to_table_tool
 from .registry import registry, ToolRegistry
 
+READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        get_available_input_files_tool.name,
+        get_shape_summary_tool.name,
+        get_xls_summary_tool.name,
+        workbook_inventory_tool.name,
+        list_named_ranges_tool.name,
+        list_tables_tool.name,
+        sample_sheet_used_csv_tool.name,
+        sample_range_csv_tool.name,
+        read_cell_tool.name,
+        read_cell_formula_tool.name,
+        read_formulas_in_range_tool.name,
+        profile_range_tool.name,
+        hello_world_tool.name,
+    }
+)
+
+EDIT_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        update_cell_tool.name,
+        bulk_update_tool.name,
+        add_row_tool.name,
+        write_range_tool.name,
+        convert_range_to_table_tool.name,
+        append_rows_to_table_tool.name,
+    }
+)
+
 __all__ = [
     "ResponseTool",
     "ToolExecutionResult",
@@ -46,4 +75,6 @@ __all__ = [
     "convert_range_to_table_tool",
     "append_rows_to_table_tool",
     "registry",
+    "READ_ONLY_TOOL_NAMES",
+    "EDIT_TOOL_NAMES",
 ]

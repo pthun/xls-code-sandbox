@@ -34,6 +34,7 @@ type VariationFile = {
   modified_at: string;
 };
 
+
 type Variation = {
   id: string;
   tool_id: number;
@@ -781,13 +782,20 @@ export default function TestVariationsView() {
                       >
                         <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                           <span className="font-medium text-foreground">
-                            {file.filename}
+                            {file.path}
                           </span>
                           <span>{formatBytes(file.size_bytes)}</span>
                         </div>
-                        <p className="mt-1 text-[11px] text-muted-foreground">
-                          Saved {formatDateTime(file.modified_at)}
-                        </p>
+                        {file.filename && file.filename !== file.path && (
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            Original name: {file.filename}
+                          </p>
+                        )}
+                        {file.modified_at && (
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            Saved {formatDateTime(file.modified_at)}
+                          </p>
+                        )}
                       </li>
                     ))}
                   </ul>

@@ -7,7 +7,6 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 __all__ = [
     "DATABASE_PATH",
@@ -103,7 +102,6 @@ def ensure_tool_exists(tool_id: int) -> None:
 
     tool_dir = (UPLOAD_ROOT / str(tool_id)).resolve()
     if not tool_dir.exists():
-        # Lazily allow creation when a tool uploads its first file.
         tool_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -306,27 +304,38 @@ def _load_variation_metadata(tool_id: int, variation_id: str) -> VariationRecord
             except ValueError:
                 pass
         for raw in payload.get("files", []):
-            name = raw.get("stored_filename") or raw.get("original_filename")
-            if not isinstance(name, str):
+            stored = raw.get("stored_filename")
+            if not isinstance(stored, str) or not stored:
                 continue
-            uploaded_at_raw = raw.get("uploaded_at")
-            if isinstance(uploaded_at_raw, str):
+            original = raw.get("original_filename") or stored
+            stored_path = directory / stored
+            uploaded_raw = raw.get("uploaded_at")
+            if isinstance(uploaded_raw, str):
                 try:
-                    uploaded_at = datetime.fromisoformat(uploaded_at_raw)
-                    if uploaded_at.tzinfo is None:
-                        uploaded_at = uploaded_at.replace(tzinfo=timezone.utc)
-                    uploaded_at = uploaded_at.astimezone(timezone.utc)
+                    uploaded = datetime.fromisoformat(uploaded_raw)
+                    if uploaded.tzinfo is None:
+                        uploaded = uploaded.replace(tzinfo=timezone.utc)
+                    uploaded = uploaded.astimezone(timezone.utc)
                 except ValueError:
-                    uploaded_at = datetime.fromtimestamp(directory.stat().st_mtime, tz=timezone.utc)
+                    uploaded = datetime.fromtimestamp(directory.stat().st_mtime, tz=timezone.utc)
             else:
-                uploaded_at = datetime.fromtimestamp(directory.stat().st_mtime, tz=timezone.utc)
-            size_bytes = int(raw.get("size_bytes", 0))
+                uploaded = datetime.fromtimestamp(directory.stat().st_mtime, tz=timezone.utc)
+            size_raw = raw.get("size_bytes")
+            if isinstance(size_raw, (int, float)):
+                size_bytes = int(size_raw)
+            elif isinstance(size_raw, str):
+                try:
+                    size_bytes = int(size_raw)
+                except ValueError:
+                    size_bytes = stored_path.stat().st_size if stored_path.exists() else 0
+            else:
+                size_bytes = stored_path.stat().st_size if stored_path.exists() else 0
             files.append(
                 VariationFileEntry(
-                    original_filename=raw.get("original_filename", name),
-                    stored_filename=name,
+                    original_filename=original,
+                    stored_filename=stored,
                     size_bytes=size_bytes,
-                    uploaded_at=uploaded_at,
+                    uploaded_at=uploaded,
                 )
             )
 
@@ -335,13 +344,12 @@ def _load_variation_metadata(tool_id: int, variation_id: str) -> VariationRecord
             if child.is_dir() or child.name == VARIATION_METADATA_FILENAME:
                 continue
             stat = child.stat()
-            uploaded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
             files.append(
                 VariationFileEntry(
                     original_filename=child.name,
                     stored_filename=child.name,
                     size_bytes=stat.st_size,
-                    uploaded_at=uploaded_at,
+                    uploaded_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
                 )
             )
 

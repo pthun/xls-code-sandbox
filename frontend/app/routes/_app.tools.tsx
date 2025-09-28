@@ -201,19 +201,6 @@ export default function ToolLayout() {
               Create script
             </NavLink>
             <NavLink
-              to="test-variations"
-              className={({ isActive }) =>
-                cn(
-                  "block rounded-md px-3 py-2 text-sm transition",
-                  isActive
-                    ? "bg-accent text-accent-foreground"
-                    : "text-muted-foreground hover:bg-accent/40"
-                )
-              }
-            >
-              Test variations
-            </NavLink>
-            <NavLink
               to="generate-eval-files"
               className={({ isActive }) =>
                 cn(
@@ -225,6 +212,19 @@ export default function ToolLayout() {
               }
             >
               Generate eval files
+            </NavLink>
+            <NavLink
+              to="test-variations"
+              className={({ isActive }) =>
+                cn(
+                  "block rounded-md px-3 py-2 text-sm transition",
+                  isActive
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent/40"
+                )
+              }
+            >
+              Test variations
             </NavLink>
           </nav>
         </div>

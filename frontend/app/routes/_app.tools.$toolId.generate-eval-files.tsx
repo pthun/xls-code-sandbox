@@ -17,6 +17,7 @@ import {
   CardHeader,
   CardTitle,
 } from "~/components/ui/card";
+import { Label } from "~/components/ui/label";
 import { cn } from "~/lib/utils";
 
 import { API_BASE_URL } from "../config";
@@ -43,6 +44,24 @@ type EvalChatResponse = {
   raw?: string | null;
 };
 
+type VariationFile = {
+  filename: string;
+  path: string;
+  size_bytes: number;
+  modified_at: string;
+};
+
+type Variation = {
+  id: string;
+  tool_id: number;
+  label: string | null;
+  created_at: string;
+  prefix: string;
+  files: VariationFile[];
+};
+
+const DEFAULT_FOLDER_PREFIX = "uploads";
+
 function createId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -66,6 +85,21 @@ export default function GenerateEvalFilesView() {
     () => `${toolApiBase}/eval-chat/history`,
     [toolApiBase]
   );
+
+  const [variations, setVariations] = useState<Variation[]>([]);
+  const [isLoadingVariations, setIsLoadingVariations] = useState(false);
+  const [variationsError, setVariationsError] = useState<string | null>(null);
+  const [isCreatingVariation, setIsCreatingVariation] = useState(false);
+  const [folderPrefix, setFolderPrefix] = useState<string>(DEFAULT_FOLDER_PREFIX);
+  const activeVariation = useMemo(
+    () => variations.find((item) => item.prefix === folderPrefix) ?? null,
+    [variations, folderPrefix]
+  );
+  const activeVariationLabel = useMemo(() => {
+    if (!activeVariation) return null;
+    return activeVariation.label?.trim() || `Variation ${activeVariation.id}`;
+  }, [activeVariation]);
+  const isVariationWorkspace = folderPrefix !== DEFAULT_FOLDER_PREFIX;
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     createInitialAssistantMessage(),
@@ -106,6 +140,81 @@ export default function GenerateEvalFilesView() {
     [persistChatHistory]
   );
 
+  const loadVariations = useCallback(async () => {
+    setIsLoadingVariations(true);
+    setVariationsError(null);
+    try {
+      const response = await fetch(`${toolApiBase}/variations`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to load variations (${response.status})`);
+      }
+      const payload = (await response.json()) as Variation[];
+      if (Array.isArray(payload)) {
+        setVariations(payload);
+      } else {
+        setVariations([]);
+      }
+    } catch (variationError) {
+      console.error("Failed to load variations", variationError);
+      setVariations([]);
+      setVariationsError(
+        variationError instanceof Error
+          ? variationError.message
+          : "Failed to load variations"
+      );
+    } finally {
+      setIsLoadingVariations(false);
+    }
+  }, [toolApiBase]);
+
+  useEffect(() => {
+    void loadVariations();
+  }, [loadVariations]);
+
+  const handleCreateVariation = useCallback(async () => {
+    const labelInput = window.prompt("Name for the new variation (optional)", "");
+    if (labelInput === null) {
+      return;
+    }
+    const label = labelInput ? labelInput.trim() : null;
+
+    setIsCreatingVariation(true);
+    setVariationsError(null);
+    try {
+      const response = await fetch(`${toolApiBase}/variations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label }),
+      });
+      if (!response.ok) {
+        let detail = `Failed to create variation (${response.status})`;
+        try {
+          const payload = (await response.json()) as { detail?: string };
+          if (payload?.detail) detail = payload.detail;
+        } catch (error) {
+          console.error(error);
+        }
+        throw new Error(detail);
+      }
+
+      const created = (await response.json()) as Variation;
+      setVariations((prev) => [created, ...prev.filter((item) => item.id !== created.id)]);
+      setFolderPrefix(created.prefix);
+    } catch (creationError) {
+      console.error("Failed to create variation", creationError);
+      setVariationsError(
+        creationError instanceof Error
+          ? creationError.message
+          : "Failed to create variation"
+      );
+    } finally {
+      setIsCreatingVariation(false);
+      void loadVariations();
+    }
+  }, [toolApiBase, loadVariations]);
+
   const loadChatHistory = useCallback(async () => {
     try {
       const response = await fetch(chatHistoryUrl, {
@@ -139,6 +248,15 @@ export default function GenerateEvalFilesView() {
     setIsClearing(false);
     void loadChatHistory();
   }, [tool.id, loadChatHistory]);
+
+  useEffect(() => {
+    setMessages([createInitialAssistantMessage()]);
+    setInput("");
+    setUsage(null);
+    setError(null);
+    setIsSending(false);
+    setIsClearing(false);
+  }, [folderPrefix]);
 
   const handleClearChat = useCallback(async () => {
     if (isClearing) {
@@ -194,7 +312,7 @@ export default function GenerateEvalFilesView() {
         const response = await fetch(`${toolApiBase}/eval-chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: historyPayload }),
+          body: JSON.stringify({ messages: historyPayload, folder_prefix: folderPrefix }),
         });
         if (!response.ok) {
           let detail = `Request failed (${response.status})`;
@@ -222,7 +340,7 @@ export default function GenerateEvalFilesView() {
         setIsSending(false);
       }
     },
-    [appendMessages, input, isSending, messages, toolApiBase]
+    [appendMessages, folderPrefix, input, isSending, messages, toolApiBase]
   );
 
   return (
@@ -234,6 +352,80 @@ export default function GenerateEvalFilesView() {
           uploaded files.
         </p>
       </header>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Workspace</CardTitle>
+          <CardDescription>
+            Choose the workspace the assistant should use for file operations.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid gap-2">
+            <Label htmlFor="workspace-select">Active workspace</Label>
+            <select
+              id="workspace-select"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              value={folderPrefix}
+              onChange={(event) => setFolderPrefix(event.target.value)}
+              disabled={isLoadingVariations || isCreatingVariation}
+            >
+              <option value={DEFAULT_FOLDER_PREFIX}>Original uploads (read-only)</option>
+              {variations.map((variation) => {
+                const label = variation.label?.trim() || `Variation ${variation.id}`;
+                return (
+                  <option key={variation.id} value={variation.prefix}>
+                    {label}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+          {variationsError && (
+            <p className="text-xs text-destructive">{variationsError}</p>
+          )}
+          {isLoadingVariations && !isCreatingVariation && (
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="size-3 animate-spin" /> Loading variations…
+            </p>
+          )}
+          {isVariationWorkspace ? (
+            <p className="text-xs text-muted-foreground">
+              Working in {activeVariationLabel || folderPrefix}. Edits will only affect files inside this
+              variation directory.
+            </p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Uploads are read-only. Create and select a variation to make inline edits safely.
+            </p>
+          )}
+        </CardContent>
+        <CardFooter className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setFolderPrefix(DEFAULT_FOLDER_PREFIX)}
+            disabled={!isVariationWorkspace}
+          >
+            Use uploads
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleCreateVariation}
+            disabled={isLoadingVariations || isCreatingVariation}
+          >
+            {isCreatingVariation ? (
+              <>
+                <Loader2 className="mr-2 size-4 animate-spin" /> Working…
+              </>
+            ) : (
+              <>New variation</>
+            )}
+          </Button>
+        </CardFooter>
+      </Card>
 
       <Card>
         <CardHeader>
