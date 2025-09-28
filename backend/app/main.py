@@ -440,110 +440,6 @@ def _create_code_version(
     return _get_code_version_detail(version)
 
 
-def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    connection.row_factory = sqlite3.Row
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {row["name"] for row in rows}
-
-
-def _apply_schema_migrations(connection: sqlite3.Connection) -> None:
-    """Upgrade legacy tables to the current schema."""
-
-    code_version_columns = _table_columns(connection, "code_versions")
-    if "params_model" not in code_version_columns:
-        connection.execute(
-            "ALTER TABLE code_versions ADD COLUMN params_model TEXT NOT NULL DEFAULT '[]'"
-        )
-    if "required_files" not in code_version_columns:
-        connection.execute(
-            "ALTER TABLE code_versions ADD COLUMN required_files TEXT NOT NULL DEFAULT '[]'"
-        )
-
-    run_columns = _table_columns(connection, "e2b_runs")
-    if "code_version" in run_columns:
-        return
-
-    legacy_rows = connection.execute(
-        """
-        SELECT id, created_at, code, params, pip_packages, allow_internet, ok, error, logs_path
-        FROM e2b_runs
-        ORDER BY created_at ASC
-        """
-    ).fetchall()
-
-    connection.execute("ALTER TABLE e2b_runs RENAME TO e2b_runs_legacy")
-    connection.execute(
-        """
-        CREATE TABLE e2b_runs (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            code_version INTEGER NOT NULL REFERENCES code_versions(version),
-            params TEXT NOT NULL,
-            pip_packages TEXT NOT NULL,
-            allow_internet INTEGER NOT NULL,
-            ok INTEGER,
-            error TEXT,
-            logs_path TEXT
-        )
-        """
-    )
-
-    for row in legacy_rows:
-        run_id = row["id"]
-        code_text = row["code"] or DEFAULT_CODE
-        pip_text = row["pip_packages"] or "[]"
-        try:
-            pip_list = json.loads(pip_text)
-        except json.JSONDecodeError:
-            pip_list = []
-
-        existing = connection.execute(
-            "SELECT version FROM code_versions WHERE origin_run_id = ? ORDER BY version DESC LIMIT 1",
-            (run_id,),
-        ).fetchone()
-        if existing is not None:
-            version_id = existing["version"]
-        else:
-            detail = _create_code_version(
-                code=code_text,
-                pip_packages=pip_list,
-                author="system",
-                note=f"Migrated from run {run_id}",
-                origin_run_id=run_id,
-            )
-            version_id = detail.version
-
-        connection.execute(
-            """
-            INSERT INTO e2b_runs (
-                id,
-                created_at,
-                code_version,
-                params,
-                pip_packages,
-                allow_internet,
-                ok,
-                error,
-                logs_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                row["created_at"],
-                version_id,
-                row["params"],
-                pip_text,
-                row["allow_internet"],
-                row["ok"],
-                row["error"],
-                row["logs_path"],
-            ),
-        )
-
-    connection.execute("DROP TABLE e2b_runs_legacy")
-    connection.commit()
-
-
 def _build_version_chat_message(
     *,
     actor: str,
@@ -879,11 +775,6 @@ def init_db() -> None:
         connection.commit()
 
     _ensure_initial_code_version()
-    with sqlite3.connect(DATABASE_PATH, check_same_thread=False) as connection:
-        connection.execute("PRAGMA foreign_keys = ON;")
-        connection.row_factory = sqlite3.Row
-        _apply_schema_migrations(connection)
-        connection.commit()
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)

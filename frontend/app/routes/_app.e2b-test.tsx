@@ -20,7 +20,6 @@ import {
   CardTitle,
 } from "~/components/ui/card";
 import { Label } from "~/components/ui/label";
-import { Separator } from "~/components/ui/separator";
 import { cn } from "~/lib/utils";
 
 import { API_BASE_URL } from "../config";
@@ -150,6 +149,22 @@ type CodeVersionDetail = CodeVersionSummary & {
 type CodeVersionUpdateResponse = {
   version: CodeVersionDetail;
   chat_message: string;
+};
+
+type PendingRun = {
+  tempId: string;
+  created_at: string;
+  logs: string[];
+  files: {
+    path: string;
+    sizeBytes: number;
+    preview: string | null;
+  }[];
+  ok: boolean | null;
+  error: string | null;
+  status: "running" | "completed" | "failed";
+  runId?: string;
+  codeVersion: number | null;
 };
 
 export function meta({}: Route.MetaArgs) {
@@ -407,8 +422,7 @@ export default function E2BAssistantRoute() {
 
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
-  const [result, setResult] = useState<SandboxRunResult | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
   const [runHistory, setRunHistory] = useState<RunSummary[]>([]);
   const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -433,6 +447,24 @@ export default function E2BAssistantRoute() {
 
   const [showCode, setShowCode] = useState(false);
   const [showPip, setShowPip] = useState(false);
+
+  const combinedRunHistory = useMemo(() => {
+    if (!pendingRun) {
+      return runHistory;
+    }
+    const placeholder: RunSummary = {
+      id: pendingRun.tempId,
+      created_at: pendingRun.created_at,
+      ok: pendingRun.ok,
+      error: pendingRun.error,
+      code_version: pendingRun.codeVersion ?? currentVersion ?? 0,
+    };
+    return [placeholder, ...runHistory];
+  }, [pendingRun, runHistory, currentVersion]);
+
+  const selectedRunIsPending = Boolean(
+    pendingRun && selectedRunId === pendingRun.tempId
+  );
 
   const fetchCurrentCodeVersion = useCallback(async () => {
     try {
@@ -497,7 +529,7 @@ export default function E2BAssistantRoute() {
     }
   }, []);
 
-  const fetchRunDetail = useCallback(async (runId: string) => {
+  const fetchRunDetail = useCallback(async (runId: string): Promise<RunDetail | null> => {
     try {
       setIsRunDetailLoading(true);
       setRunDetailError(null);
@@ -507,11 +539,14 @@ export default function E2BAssistantRoute() {
       }
       const data = (await response.json()) as RunDetail;
       setRunDetail(data);
+      setPendingRun((prev) => (prev && prev.runId === data.id ? null : prev));
+      return data;
     } catch (error) {
       setRunDetailError(
         error instanceof Error ? error.message : "Unable to load run detail"
       );
       setRunDetail(null);
+      return null;
     } finally {
       setIsRunDetailLoading(false);
     }
@@ -657,10 +692,23 @@ export default function E2BAssistantRoute() {
       return;
     }
 
+    const tempId = createId();
+    setPendingRun({
+      tempId,
+      created_at: new Date().toISOString(),
+      logs: [],
+      files: [],
+      ok: null,
+      error: null,
+      status: "running",
+      runId: undefined,
+      codeVersion: currentVersion,
+    });
+    setSelectedRunId(tempId);
+    setRunDetail(null);
+    setRunDetailError(null);
     setIsRunning(true);
     setRunError(null);
-    setResult(null);
-    setLogs([]);
 
     try {
       const liveLogs: string[] = [];
@@ -690,6 +738,13 @@ export default function E2BAssistantRoute() {
       const decoder = new TextDecoder();
       let buffer = "";
 
+      const appendLogs = (lines: string[]) => {
+        if (!lines.length) return;
+        setPendingRun((prev) =>
+          prev ? { ...prev, logs: [...prev.logs, ...lines] } : prev
+        );
+      };
+
       const processLine = (line: string) => {
         const trimmedLine = line.trim();
         if (!trimmedLine) return;
@@ -703,7 +758,7 @@ export default function E2BAssistantRoute() {
 
         if (event.type === "log" && Array.isArray(event.lines)) {
           liveLogs.push(...event.lines);
-          setLogs((prev) => [...prev, ...event.lines!]);
+          appendLogs(event.lines);
           return;
         }
 
@@ -726,9 +781,22 @@ export default function E2BAssistantRoute() {
                 ? payload.error
                 : null,
           };
-          setLogs(normalized.logs.length ? normalized.logs : liveLogs);
-          setResult(normalized);
           const combinedLogs = normalized.logs.length ? normalized.logs : liveLogs;
+          appendLogs(combinedLogs);
+          setPendingRun((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  runId: normalized.runId || prev.runId,
+                  codeVersion: normalized.codeVersion ?? prev.codeVersion,
+                  ok: normalized.ok,
+                  error: normalized.error,
+                  files: normalized.files,
+                  logs: combinedLogs,
+                  status: normalized.ok ? "completed" : "failed",
+                }
+              : prev
+          );
           const recentLogs = combinedLogs.slice(-40);
           const runMessage: ChatMessage = {
             id: createId(),
@@ -737,15 +805,22 @@ export default function E2BAssistantRoute() {
             kind: "run-result",
           };
           setMessages((prev) => [...prev, runMessage]);
-          setSelectedRunId(normalized.runId || null);
-          void fetchRunHistory().then((history) => {
-            if (normalized.runId) {
-              const exists = history.some((item) => item.id === normalized.runId);
+          const targetRunId = normalized.runId;
+          if (targetRunId) {
+            void fetchRunHistory().then((history) => {
+              const exists = history.some((item) => item.id === targetRunId);
               if (exists) {
-                void fetchRunDetail(normalized.runId);
+                setSelectedRunId(targetRunId);
+                void fetchRunDetail(targetRunId).then(() => {
+                  setPendingRun((prev) =>
+                    prev && prev.runId === targetRunId ? null : prev
+                  );
+                });
               }
-            }
-          });
+            });
+          } else {
+            void fetchRunHistory();
+          }
           return;
         }
 
@@ -753,6 +828,9 @@ export default function E2BAssistantRoute() {
           const detailText = formatRunError(
             event.detail,
             typeof event.message === "string" ? event.message : "Sandbox run failed."
+          );
+          setPendingRun((prev) =>
+            prev ? { ...prev, status: "failed", error: detailText, ok: false } : prev
           );
           setRunError(detailText);
         }
@@ -777,6 +855,9 @@ export default function E2BAssistantRoute() {
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to execute code in the sandbox";
+      setPendingRun((prev) =>
+        prev ? { ...prev, status: "failed", error: message, ok: false } : prev
+      );
       setRunError(message);
     } finally {
       setIsRunning(false);
@@ -787,6 +868,7 @@ export default function E2BAssistantRoute() {
     pipPackages,
     paramsText,
     isRunning,
+    currentVersion,
     fetchRunHistory,
     fetchRunDetail,
   ]);
@@ -911,15 +993,22 @@ export default function E2BAssistantRoute() {
   const handleSelectRun = useCallback(
     async (runId: string) => {
       setSelectedRunId(runId);
+      if (pendingRun && runId === pendingRun.tempId) {
+        return;
+      }
       await fetchRunDetail(runId);
     },
-    [fetchRunDetail]
+    [fetchRunDetail, pendingRun]
   );
 
   const handleDeleteRun = useCallback(
     async (runId: string) => {
       const confirmed = window.confirm("Delete this run and all associated files?");
       if (!confirmed) {
+        return;
+      }
+      if (pendingRun && (runId === pendingRun.tempId || runId === pendingRun.runId)) {
+        window.alert("The active run cannot be deleted while it is in progress.");
         return;
       }
       try {
@@ -940,10 +1029,8 @@ export default function E2BAssistantRoute() {
         );
       }
     },
-    [fetchRunHistory, selectedRunId]
+    [fetchRunHistory, pendingRun, selectedRunId]
   );
-
-  const artifacts = useMemo(() => result?.files ?? [], [result]);
 
   return (
     <div className="mx-auto flex w-full flex-col gap-6 lg:flex-row">
@@ -1034,287 +1121,328 @@ export default function E2BAssistantRoute() {
           </CardFooter>
         </Card>
 
-        {(isRunning || runError || result || logs.length > 0) && (
-          <Card>
+        <div className="flex flex-col gap-4 lg:flex-row">
+          <Card className="lg:w-72">
             <CardHeader>
-              <CardTitle>Sandbox Run</CardTitle>
+              <CardTitle>Run history</CardTitle>
               <CardDescription>
-                Execute the latest code and review logs and artifacts. Runs automatically share a
-                summary back with the assistant.
+                Review previous sandbox executions. Select a run to inspect or remove it.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {historyError && (
+                <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  {historyError}
+                </p>
+              )}
+              {isHistoryLoading ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" /> Loading runs…
+                </div>
+              ) : combinedRunHistory.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No sandbox runs recorded yet.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {combinedRunHistory.map((run) => {
+                    const isPendingEntry = pendingRun && run.id === pendingRun.tempId;
+                    const isSelected =
+                      selectedRunId === run.id ||
+                      (isPendingEntry && selectedRunId === pendingRun?.tempId);
+                    const statusLabel = isPendingEntry
+                      ? pendingRun.status === "running"
+                        ? "running"
+                        : pendingRun.status === "failed"
+                        ? "failed"
+                        : "completed"
+                      : run.ok == null
+                      ? "unknown"
+                      : run.ok
+                      ? "success"
+                      : "failure";
+                    const statusClass = isPendingEntry
+                      ? pendingRun.status === "failed"
+                        ? "text-destructive"
+                        : pendingRun.status === "completed"
+                        ? "text-emerald-600"
+                        : "text-muted-foreground"
+                      : run.ok
+                      ? "text-emerald-600"
+                      : run.ok === false
+                      ? "text-destructive"
+                      : "text-muted-foreground";
+                    const versionValue = isPendingEntry
+                      ? pendingRun.codeVersion ?? currentVersion ?? undefined
+                      : run.code_version;
+                    const versionText =
+                      versionValue != null && versionValue > 0 ? versionValue : "?";
+                    const displayedError = isPendingEntry
+                      ? pendingRun.error
+                      : run.error;
+                    return (
+                      <li
+                        key={run.id}
+                        className={cn(
+                          "rounded-md border border-border px-3 py-2 text-sm transition",
+                          isSelected ? "bg-accent/30" : "bg-background"
+                        )}
+                      >
+                        <div className="flex flex-col gap-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-medium">{formatDateTime(run.created_at)}</span>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => handleSelectRun(run.id)}
+                              >
+                                View
+                              </Button>
+                              {!(pendingRun && run.id === pendingRun.tempId) && (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => handleDeleteRun(run.id)}
+                                >
+                                  <Trash2 className="mr-1 size-3" /> Delete
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-muted-foreground">
+                            <span className={statusClass}>
+                              {statusLabel === "running" && (
+                                <Loader2 className="mr-1 inline size-3 animate-spin" />
+                              )}
+                              {statusLabel.charAt(0).toUpperCase() + statusLabel.slice(1)}
+                            </span>
+                            <span>
+                              Version {versionText}
+                              {displayedError ? ` · ${displayedError}` : ""}
+                            </span>
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card className="flex-1">
+            <CardHeader>
+              <CardTitle>Run details</CardTitle>
+              <CardDescription>
+                {selectedRunIsPending
+                  ? pendingRun?.runId ?? pendingRun?.tempId ?? "Pending run"
+                  : selectedRunId ?? "Select a run to inspect logs and artifacts."}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {isRunning && (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="size-4 animate-spin" /> Running in the sandbox…
-                </div>
-              )}
-
-              {runError && (
-                <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                  {runError}
-                </p>
-              )}
-
-              {result && (
-                <div className="space-y-2 text-sm">
-                  <div className="flex items-center justify-between">
-                    <span>Status</span>
-                    <span className={result.ok ? "text-emerald-600" : "text-destructive"}>
-                      {result.ok ? "Completed" : "Failed"}
-                    </span>
-                  </div>
-                  {result.runId && (
-                    <p className="text-xs text-muted-foreground">Run ID: {result.runId}</p>
-                  )}
-                  {result.error && (
-                    <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                      {result.error}
-                    </p>
-                  )}
-                </div>
-              )}
-
-              <section className="space-y-2">
-                <h3 className="text-sm font-semibold">Logs</h3>
-                {logs.length === 0 ? (
-                  <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                    No log output yet.
-                  </p>
-                ) : (
-                  <pre className="max-h-[320px] overflow-y-auto rounded-md border border-border bg-muted/30 p-3 text-xs">
-                    {logs.join("\n")}
-                  </pre>
-                )}
-              </section>
-
-              <Separator />
-
-              <section className="space-y-2">
-                <h3 className="text-sm font-semibold">Artifacts</h3>
-                {artifacts.length === 0 ? (
-                  <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                    No artifacts were produced during this run.
-                  </p>
-                ) : (
-                  <ul className="space-y-3 text-xs">
-                    {artifacts.map((file) => (
-                      <li key={file.path} className="rounded-md border border-border bg-muted/30 p-3">
-                        <div className="flex items-center justify-between gap-4 text-[11px] uppercase tracking-wide text-muted-foreground">
-                          <span className="truncate font-medium normal-case text-foreground">
-                            {file.path}
-                          </span>
-                          <span>{formatBytes(file.sizeBytes)}</span>
-                        </div>
-                        {file.preview && (
-                          <pre className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded bg-background/80 p-2 text-[11px]">
-                            {file.preview}
-                          </pre>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-            </CardContent>
-          </Card>
-        )}
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Run history</CardTitle>
-            <CardDescription>
-              Review previous sandbox executions. Select a run to inspect or remove it.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {historyError && (
-              <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                {historyError}
-              </p>
-            )}
-            {isHistoryLoading ? (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" /> Loading runs…
-              </div>
-            ) : runHistory.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No sandbox runs recorded yet.</p>
-            ) : (
-              <ul className="space-y-2">
-                {runHistory.map((run) => {
-                  const isSelected = selectedRunId === run.id;
-                  return (
-                    <li
-                      key={run.id}
-                      className={cn(
-                        "rounded-md border border-border px-3 py-2 text-sm transition",
-                        isSelected ? "bg-accent/30" : "bg-background"
-                      )}
-                    >
-                      <div className="flex flex-col gap-1">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-medium">{formatDateTime(run.created_at)}</span>
-                          <div className="flex items-center gap-1">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleSelectRun(run.id)}
-                            >
-                              View
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleDeleteRun(run.id)}
-                            >
-                              <Trash2 className="mr-1 size-3" /> Delete
-                            </Button>
-                          </div>
-                        </div>
-                        <div className="flex items-center justify-between text-xs text-muted-foreground">
-                          <span>
-                            Status: {run.ok == null ? "unknown" : run.ok ? "success" : "failure"}
-                          </span>
-                          <span>
-                            Version {run.code_version}
-                            {run.error ? ` · ${run.error}` : ""}
-                          </span>
-                        </div>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </CardContent>
-        </Card>
-
-        {selectedRunId && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Run details</CardTitle>
-              <CardDescription>{selectedRunId}</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {isRunDetailLoading ? (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="size-4 animate-spin" /> Loading run details…
-                </div>
-              ) : runDetailError ? (
-                <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                  {runDetailError}
-                </p>
-              ) : runDetail ? (
+              {selectedRunIsPending && pendingRun ? (
                 <div className="space-y-4 text-sm">
                   <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>{formatDateTime(runDetail.created_at)}</span>
+                    <span>{formatDateTime(pendingRun.created_at)}</span>
                     <span
-                      className={
-                        runDetail.ok == null
-                          ? "text-muted-foreground"
-                          : runDetail.ok
+                      className={cn(
+                        pendingRun.status === "failed"
+                          ? "text-destructive"
+                          : pendingRun.status === "completed"
                           ? "text-emerald-600"
-                          : "text-destructive"
-                      }
+                          : "text-muted-foreground"
+                      )}
                     >
-                      {runDetail.ok == null ? "Unknown" : runDetail.ok ? "Success" : "Failure"}
+                      {pendingRun.status === "running"
+                        ? "Running"
+                        : pendingRun.status === "failed"
+                        ? "Failed"
+                        : "Completed"}
                     </span>
                   </div>
-                  {runDetail.error && (
-                    <p className="text-xs text-destructive">{runDetail.error}</p>
+                  {pendingRun.runId && (
+                    <p className="text-xs text-muted-foreground">Run ID: {pendingRun.runId}</p>
                   )}
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>Code version {runDetail.code_version}</span>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => handleRevertVersion(runDetail.code_version, `Revert from run ${runDetail.id}`)}
-                    >
-                      Revert to this version
-                    </Button>
-                  </div>
-
-                  <section className="space-y-2">
-                    <h3 className="text-sm font-semibold">Code snapshot</h3>
-                    <pre className="max-h-[320px] overflow-y-auto rounded-md border border-border bg-muted/20 p-3 text-xs">
-                      {runDetail.code}
-                    </pre>
-                  </section>
-
-                  <section className="space-y-2">
-                    <h3 className="text-sm font-semibold">Parameters</h3>
-                    <pre className="rounded-md border border-border bg-muted/20 p-3 text-xs">
-                      {JSON.stringify(runDetail.params, null, 2)}
-                    </pre>
-                  </section>
-
-                  <section className="space-y-2">
-                    <h3 className="text-sm font-semibold">Pip packages</h3>
-                    {runDetail.pip_packages.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">No packages were installed.</p>
-                    ) : (
-                      <ul className="space-y-1 text-xs">
-                        {runDetail.pip_packages.map((pkg) => (
-                          <li key={pkg} className="rounded bg-muted/30 px-2 py-1 font-mono">
-                            {pkg}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </section>
-
+                  {pendingRun.codeVersion != null && (
+                    <p className="text-xs text-muted-foreground">
+                      Code version {pendingRun.codeVersion ?? "?"}
+                    </p>
+                  )}
+                  {pendingRun.error && (
+                    <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                      {pendingRun.error}
+                    </p>
+                  )}
                   <section className="space-y-2">
                     <h3 className="text-sm font-semibold">Logs</h3>
-                    {runDetail.logs.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">No logs were captured.</p>
+                    {pendingRun.logs.length === 0 ? (
+                      <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        No log output yet.
+                      </p>
                     ) : (
-                      <pre className="max-h-[240px] overflow-y-auto rounded-md border border-border bg-muted/20 p-3 text-xs">
-                        {runDetail.logs.join("\n")}
+                      <pre className="max-h-[320px] overflow-y-auto rounded-md border border-border bg-muted/30 p-3 text-xs">
+                        {pendingRun.logs.join("\n")}
                       </pre>
                     )}
                   </section>
-
                   <section className="space-y-2">
-                    <h3 className="text-sm font-semibold">Files</h3>
-                    {runDetail.files.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">No files were preserved.</p>
+                    <h3 className="text-sm font-semibold">Artifacts</h3>
+                    {pendingRun.files.length === 0 ? (
+                      <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        No artifacts were produced during this run.
+                      </p>
                     ) : (
-                      <ul className="space-y-2 text-xs">
-                        {runDetail.files.map((file) => (
+                      <ul className="space-y-3 text-xs">
+                        {pendingRun.files.map((file) => (
                           <li
-                            key={file.local_path}
-                            className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-2"
+                            key={file.path}
+                            className="rounded-md border border-border bg-muted/30 p-3"
                           >
-                            <div className="flex-1">
-                              <p className="font-mono">{file.sandbox_path}</p>
-                              <p className="text-[11px] text-muted-foreground">
-                                {file.local_path} · {formatBytes(file.size_bytes)}
-                              </p>
+                            <div className="flex items-center justify-between gap-4 text-[11px] uppercase tracking-wide text-muted-foreground">
+                              <span className="truncate font-medium normal-case text-foreground">
+                                {file.path}
+                              </span>
+                              <span>{formatBytes(file.sizeBytes)}</span>
                             </div>
-                            <Button asChild variant="ghost" size="icon" title="Download file">
-                              <a
-                                href={`${API_BASE_URL}${file.download_url}`}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                <Download className="size-4" />
-                              </a>
-                            </Button>
+                            {file.preview && (
+                              <pre className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded bg-background/80 p-2 text-[11px]">
+                                {file.preview}
+                              </pre>
+                            )}
                           </li>
                         ))}
                       </ul>
                     )}
                   </section>
                 </div>
+              ) : selectedRunId ? (
+                isRunDetailLoading && (!runDetail || runDetail.id !== selectedRunId) ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="size-4 animate-spin" /> Loading run details…
+                  </div>
+                ) : runDetailError ? (
+                  <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                    {runDetailError}
+                  </p>
+                ) : runDetail && runDetail.id === selectedRunId ? (
+                  <div className="space-y-4 text-sm">
+                    <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <span>{formatDateTime(runDetail.created_at)}</span>
+                      <span
+                        className={
+                          runDetail.ok == null
+                            ? "text-muted-foreground"
+                            : runDetail.ok
+                            ? "text-emerald-600"
+                            : "text-destructive"
+                        }
+                      >
+                        {runDetail.ok == null ? "Unknown" : runDetail.ok ? "Success" : "Failure"}
+                      </span>
+                    </div>
+                    {runDetail.error && (
+                      <p className="text-xs text-destructive">{runDetail.error}</p>
+                    )}
+                    <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <span>Code version {runDetail.code_version}</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleRevertVersion(runDetail.code_version, `Revert from run ${runDetail.id}`)}
+                      >
+                        Revert to this version
+                      </Button>
+                    </div>
+
+                    <section className="space-y-2">
+                      <h3 className="text-sm font-semibold">Code snapshot</h3>
+                      <pre className="max-h-[320px] overflow-y-auto rounded-md border border-border bg-muted/20 p-3 text-xs">
+                        {runDetail.code}
+                      </pre>
+                    </section>
+
+                    <section className="space-y-2">
+                      <h3 className="text-sm font-semibold">Parameters</h3>
+                      <pre className="rounded-md border border-border bg-muted/20 p-3 text-xs">
+                        {JSON.stringify(runDetail.params, null, 2)}
+                      </pre>
+                    </section>
+
+                    <section className="space-y-2">
+                      <h3 className="text-sm font-semibold">Pip packages</h3>
+                      {runDetail.pip_packages.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No packages were installed.</p>
+                      ) : (
+                        <ul className="space-y-1 text-xs">
+                          {runDetail.pip_packages.map((pkg) => (
+                            <li key={pkg} className="rounded bg-muted/30 px-2 py-1 font-mono">
+                              {pkg}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+
+                    <section className="space-y-2">
+                      <h3 className="text-sm font-semibold">Logs</h3>
+                      {runDetail.logs.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No logs were captured.</p>
+                      ) : (
+                        <pre className="max-h-[240px] overflow-y-auto rounded-md border border-border bg-muted/20 p-3 text-xs">
+                          {runDetail.logs.join("\n")}
+                        </pre>
+                      )}
+                    </section>
+
+                    <section className="space-y-2">
+                      <h3 className="text-sm font-semibold">Files</h3>
+                      {runDetail.files.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No files were preserved.</p>
+                      ) : (
+                        <ul className="space-y-2 text-xs">
+                          {runDetail.files.map((file) => (
+                            <li
+                              key={file.local_path}
+                              className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-2"
+                            >
+                              <div className="flex-1">
+                                <p className="font-mono">{file.sandbox_path}</p>
+                                <p className="text-[11px] text-muted-foreground">
+                                  {file.local_path} · {formatBytes(file.size_bytes)}
+                                </p>
+                              </div>
+                              <Button asChild variant="ghost" size="icon" title="Download file">
+                                <a
+                                  href={`${API_BASE_URL}${file.download_url}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  <Download className="size-4" />
+                                </a>
+                              </Button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  </div>
+                ) : runError ? (
+                  <p className="text-sm text-muted-foreground">{runError}</p>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    Select a run to view details.
+                  </p>
+                )
               ) : (
-                <p className="text-sm text-muted-foreground">Select a run to view details.</p>
+                <p className="text-sm text-muted-foreground">
+                  Select a run to inspect logs and artifacts.
+                </p>
               )}
             </CardContent>
           </Card>
-        )}
+        </div>
       </div>
 
       <aside className="w-full space-y-4 lg:w-80 lg:shrink-0">
@@ -1596,6 +1724,11 @@ export default function E2BAssistantRoute() {
                 spellCheck={false}
               />
             </div>
+            {runError && (
+              <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {runError}
+              </p>
+            )}
           </CardContent>
           <CardFooter>
             <Button type="button" disabled={isRunning} onClick={handleRun} className="w-full">
