@@ -35,6 +35,7 @@ class SandboxExecutionResult:
     logs_path: Path | None
     run_dir: Path | None
     code_version: int
+    code_version_id: int | None = None
 
 
 E2B_APP_DIR = "/app"

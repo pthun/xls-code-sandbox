@@ -1,4 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useOutletContext } from "react-router";
 import {
   ChevronDown,
   ChevronUp,
@@ -23,7 +24,7 @@ import { Label } from "~/components/ui/label";
 import { cn } from "~/lib/utils";
 
 import { API_BASE_URL } from "../config";
-import type { Route } from "./+types/_app.e2b-test";
+import type { ToolLayoutContextValue } from "./_app.tools";
 
 const DEFAULT_CODE = `def run(params, ctx):
     """Example run implementation."""
@@ -167,16 +168,6 @@ type PendingRun = {
   runId?: string;
   codeVersion: number | null;
 };
-
-export function meta({}: Route.MetaArgs) {
-  return [
-    { title: "E2B Assistant | XLS Workspace" },
-    {
-      name: "description",
-      content: "Collaborate with ChatGPT to build sandbox code, then run it directly in E2B.",
-    },
-  ];
-}
 
 function createId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -400,7 +391,9 @@ function stripRunResultTags(content: string) {
   return content.replace(/<\/??RunResult>/gi, "").trim();
 }
 
-export default function E2BAssistantRoute() {
+export default function CreateScriptView() {
+  const { tool } = useOutletContext<ToolLayoutContextValue>();
+  const toolApiBase = useMemo(() => `${API_BASE_URL}/api/tools/${tool.id}`, [tool.id]);
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     {
       id: createId(),
@@ -447,6 +440,46 @@ export default function E2BAssistantRoute() {
   const [showCode, setShowCode] = useState(false);
   const [showPip, setShowPip] = useState(false);
 
+  useEffect(() => {
+    setMessages([
+      {
+        id: createId(),
+        role: "assistant",
+        content:
+          "Hi! Describe the tool you’d like to build. I’ll suggest Python code for the sandbox and list any pip packages I need.",
+      },
+    ]);
+    setInput("");
+    setChatError(null);
+    setCurrentCode(DEFAULT_CODE);
+    setPipPackages([]);
+    setParamSpecs([]);
+    setRequiredFiles([]);
+    setParamsText(DEFAULT_PARAMS);
+    setCurrentVersion(null);
+    setRunHistory([]);
+    setHistoryError(null);
+    setVersions([]);
+    setSelectedRunId(null);
+    setRunDetail(null);
+    setRunDetailError(null);
+    setPendingRun(null);
+    setRunError(null);
+    setIsGenerating(false);
+    setIsRunning(false);
+    setIsCodeLoading(false);
+    setIsVersionsLoading(false);
+    setIsHistoryLoading(false);
+    setIsRunDetailLoading(false);
+    setVersionActionError(null);
+    setCodeLoadError(null);
+    setVersionsError(null);
+    setIsSavingVersion(false);
+    setShowEditor(false);
+    setShowCode(false);
+    setShowPip(false);
+  }, [tool.id]);
+
   const combinedRunHistory = useMemo(() => {
     if (!pendingRun) {
       return runHistory;
@@ -469,7 +502,7 @@ export default function E2BAssistantRoute() {
     try {
       setIsCodeLoading(true);
       setCodeLoadError(null);
-      const response = await fetch(`${API_BASE_URL}/api/e2b-code/current`);
+      const response = await fetch(`${toolApiBase}/e2b-code/current`);
       if (!response.ok) {
         throw new Error(`Failed to load current code (${response.status})`);
       }
@@ -486,13 +519,13 @@ export default function E2BAssistantRoute() {
     } finally {
       setIsCodeLoading(false);
     }
-  }, []);
+  }, [toolApiBase]);
 
   const fetchVersions = useCallback(async () => {
     try {
       setIsVersionsLoading(true);
       setVersionsError(null);
-      const response = await fetch(`${API_BASE_URL}/api/e2b-code/versions`);
+      const response = await fetch(`${toolApiBase}/e2b-code/versions`);
       if (!response.ok) {
         throw new Error(`Failed to load code versions (${response.status})`);
       }
@@ -505,13 +538,13 @@ export default function E2BAssistantRoute() {
     } finally {
       setIsVersionsLoading(false);
     }
-  }, []);
+  }, [toolApiBase]);
 
   const fetchRunHistory = useCallback(async () => {
     try {
       setIsHistoryLoading(true);
       setHistoryError(null);
-      const response = await fetch(`${API_BASE_URL}/api/e2b-runs`);
+      const response = await fetch(`${toolApiBase}/e2b-runs`);
       if (!response.ok) {
         throw new Error(`Failed to load run history (${response.status})`);
       }
@@ -526,13 +559,13 @@ export default function E2BAssistantRoute() {
     } finally {
       setIsHistoryLoading(false);
     }
-  }, []);
+  }, [toolApiBase]);
 
   const fetchRunDetail = useCallback(async (runId: string): Promise<RunDetail | null> => {
     try {
       setIsRunDetailLoading(true);
       setRunDetailError(null);
-      const response = await fetch(`${API_BASE_URL}/api/e2b-runs/${runId}`);
+      const response = await fetch(`${toolApiBase}/e2b-runs/${runId}`);
       if (!response.ok) {
         throw new Error(`Failed to load run detail (${response.status})`);
       }
@@ -549,7 +582,7 @@ export default function E2BAssistantRoute() {
     } finally {
       setIsRunDetailLoading(false);
     }
-  }, []);
+  }, [toolApiBase]);
 
   useEffect(() => {
     void fetchRunHistory();
@@ -611,7 +644,7 @@ export default function E2BAssistantRoute() {
 
         history.push({ role: "user", content });
 
-        const response = await fetch(`${API_BASE_URL}/api/e2b-chat`, {
+        const response = await fetch(`${toolApiBase}/e2b-chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ messages: history }),
@@ -670,6 +703,7 @@ export default function E2BAssistantRoute() {
       paramSpecs,
       requiredFiles,
       fetchVersions,
+      toolApiBase,
     ]
   );
 
@@ -712,7 +746,7 @@ export default function E2BAssistantRoute() {
     try {
       const liveLogs: string[] = [];
 
-      const response = await fetch(`${API_BASE_URL}/api/e2b-test/stream`, {
+      const response = await fetch(`${toolApiBase}/e2b-test/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -870,6 +904,7 @@ export default function E2BAssistantRoute() {
     currentVersion,
     fetchRunHistory,
     fetchRunDetail,
+    toolApiBase,
   ]);
 
   const handleOpenEditor = useCallback(() => {
@@ -915,7 +950,7 @@ export default function E2BAssistantRoute() {
         required_files: parsedFiles,
         note: editorNote.trim() || undefined,
       });
-      const response = await fetch(`${API_BASE_URL}/api/e2b-code/versions`, {
+      const response = await fetch(`${toolApiBase}/e2b-code/versions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
@@ -943,7 +978,15 @@ export default function E2BAssistantRoute() {
     } finally {
       setIsSavingVersion(false);
     }
-  }, [draftCode, draftPip, draftParams, draftFilePatterns, editorNote, fetchVersions]);
+  }, [
+    draftCode,
+    draftPip,
+    draftParams,
+    draftFilePatterns,
+    editorNote,
+    fetchVersions,
+    toolApiBase,
+  ]);
 
   const handleRevertVersion = useCallback(
     async (targetVersion: number, noteOverride?: string) => {
@@ -955,7 +998,7 @@ export default function E2BAssistantRoute() {
       try {
         setIsSavingVersion(true);
         setVersionActionError(null);
-        const response = await fetch(`${API_BASE_URL}/api/e2b-code/revert`, {
+        const response = await fetch(`${toolApiBase}/e2b-code/revert`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -986,7 +1029,7 @@ export default function E2BAssistantRoute() {
         setIsSavingVersion(false);
       }
     },
-    [fetchVersions]
+    [fetchVersions, toolApiBase]
   );
 
   const handleSelectRun = useCallback(
@@ -1011,7 +1054,7 @@ export default function E2BAssistantRoute() {
         return;
       }
       try {
-        const response = await fetch(`${API_BASE_URL}/api/e2b-runs/${runId}`, {
+        const response = await fetch(`${toolApiBase}/e2b-runs/${runId}`, {
           method: "DELETE",
         });
         if (!response.ok) {
@@ -1028,12 +1071,18 @@ export default function E2BAssistantRoute() {
         );
       }
     },
-    [fetchRunHistory, pendingRun, selectedRunId]
+    [fetchRunHistory, pendingRun, selectedRunId, toolApiBase]
   );
 
   return (
     <div className="mx-auto flex w-full flex-col gap-6 lg:flex-row">
       <div className="flex-1 space-y-6">
+        <header className="space-y-1">
+          <h1 className="text-2xl font-semibold">Create script</h1>
+          <p className="text-sm text-muted-foreground">
+            Collaborate with the assistant to build and run the sandbox script for {tool.name}.
+          </p>
+        </header>
         <Card>
           <CardHeader>
             <CardTitle>Chat with the Assistant</CardTitle>

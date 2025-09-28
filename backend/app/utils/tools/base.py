@@ -7,10 +7,6 @@ from typing import Any, Protocol
 
 from openai.types.responses import (
     FunctionToolParam,
-    Response,
-    ResponseFunctionToolCallParam,
-    ResponseInputItemParam,
-    ResponseUsage,
 )
 
 
@@ -26,12 +22,9 @@ class ToolExecutor(Protocol):
 @dataclass(slots=True)
 class ToolExecutionResult:
     """Outcome produced by running a tool handler."""
-
-    tool_call: ResponseFunctionToolCallParam
-    output: ResponseInputItemParam
-    response: Response | None = None
-    usage: ResponseUsage | None = None
-
+    success: bool
+    output: str
+    error: str | None = None
 
 @dataclass(slots=True)
 class ResponseTool:
@@ -45,7 +38,8 @@ class ResponseTool:
         """Execute the tool and return the captured result."""
 
         payload = arguments or {}
-        return await self.executor(arguments=payload)
+        result = await self.executor(arguments=payload)
+        return result
 
     def as_param(self) -> FunctionToolParam:
         """Expose the OpenAI Responses-compatible tool definition."""

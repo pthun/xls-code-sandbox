@@ -112,18 +112,6 @@ export default function AppLayout() {
 
         <nav className="mt-6 flex-1 space-y-1 overflow-y-auto pr-1 text-sm">
           <NavLink
-            to="/e2b-test"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center justify-between rounded-md border border-transparent px-3 py-2 transition",
-                isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-              )
-            }
-          >
-            <span className="font-medium">E2B Sandbox</span>
-          </NavLink>
-
-          <NavLink
             to="/tool_test"
             className={({ isActive }) =>
               cn(

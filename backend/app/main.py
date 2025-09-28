@@ -12,7 +12,7 @@ import urllib.parse
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Generator, Literal, Sequence, cast
+from typing import Any, Callable, Generator, Literal, Sequence
 from uuid import uuid4
 
 import dotenv
@@ -22,6 +22,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
+from openai.types.responses import ResponseInputItemParam
 
 from .prompts.e2b_assistant import E2B_ASSISTANT_PROMPT
 from .utils.e2b import (
@@ -32,7 +33,6 @@ from .utils.e2b import (
     execute_e2b_test,
 )
 from .utils.openai import (
-    RoleLiteral,
     call_openai_responses,
 )
 from .utils.tools import registry as tool_registry
@@ -156,9 +156,9 @@ class ToolTestPayload(BaseModel):
     usage: dict[str, Any] | None = None
     raw_text: str
     pip_packages: list[str] = Field(default_factory=list)
-    params: list[ParamMetadata] = Field(default_factory=list)
-    required_files: list[FileMetadata] = Field(default_factory=list)
-    executions: list[ToolExecutionPayload] = Field(default_factory=list)
+    params: list[ParamMetadata] = Field(default_factory=lambda: [])
+    required_files: list[FileMetadata] = Field(default_factory=lambda: [])
+    executions: list[ToolExecutionPayload] = Field(default_factory=lambda: [])
 
 
 def _usage_from_tokens(
@@ -175,41 +175,38 @@ def _usage_from_tokens(
     )
 
 
-def _ensure_initial_code_version() -> None:
+def _ensure_initial_code_version_for_tool(tool_id: int) -> CodeVersionDetail:
+    _ensure_tool_exists(tool_id)
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA foreign_keys = ON;")
-        row = connection.execute("SELECT COUNT(*) AS count FROM code_versions").fetchone()
-        if row and row["count"] == 0:
-            now = datetime.now(timezone.utc)
-            connection.execute(
-                """
-                INSERT INTO code_versions (
-                    created_at,
-                    author,
-                    note,
-                    code,
-                    pip_packages,
-                    origin_run_id,
-                    params_model,
-                    required_files
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    _iso(now),
-                    "system",
-                    "Initial version",
-                    DEFAULT_CODE,
-                    json.dumps(DEFAULT_PIP_PACKAGES),
-                    None,
-                    json.dumps([]),
-                    json.dumps([]),
-                ),
-            )
-            connection.commit()
+        row = connection.execute(
+            """
+            SELECT tool_version
+            FROM code_versions
+            WHERE tool_id = ?
+            ORDER BY tool_version DESC
+            LIMIT 1
+            """,
+            (tool_id,),
+        ).fetchone()
+        if row is not None and row["tool_version"]:
+            version = int(row["tool_version"])
+            return _get_code_version_detail(tool_id, version)
     finally:
         connection.close()
+
+    return _create_code_version(
+        tool_id=tool_id,
+        code=DEFAULT_CODE,
+        pip_packages=DEFAULT_PIP_PACKAGES,
+        author="system",
+        note="Initial version",
+        origin_run_id=None,
+        params=[],
+        required_files=[],
+    )
 
 
 def _parse_param_specs(value: str | None) -> list[ParamSpec]:
@@ -273,11 +270,19 @@ def _coerce_file_requirements(items: Sequence[FileMetadata]) -> list[FileRequire
 
 
 def _params_to_dicts(items: Sequence[ParamSpec]) -> list[ParamMetadata]:
-    return [cast(ParamMetadata, item.model_dump()) for item in items]
+    dictionaries: list[ParamMetadata] = []
+    for item in items:
+        dumped = item.model_dump()
+        dictionaries.append({key: value for key, value in dumped.items()})
+    return dictionaries
 
 
 def _files_to_dicts(items: Sequence[FileRequirement]) -> list[FileMetadata]:
-    return [cast(FileMetadata, item.model_dump()) for item in items]
+    dictionaries: list[FileMetadata] = []
+    for item in items:
+        dumped = item.model_dump()
+        dictionaries.append({key: value for key, value in dumped.items()})
+    return dictionaries
 
 
 def _param_matches_type(value: Any, expected: str) -> bool:
@@ -347,59 +352,53 @@ def _validate_run_inputs(payload: E2BTestRequest, detail: CodeVersionDetail) -> 
 
 
 def _row_to_code_version_detail(row: sqlite3.Row) -> CodeVersionDetail:
+    params_payload = row["params_model"] if "params_model" in row.keys() else None
+    files_payload = row["required_files"] if "required_files" in row.keys() else None
+    tool_version = row["tool_version"] if "tool_version" in row.keys() else None
+    if tool_version is None:
+        tool_version = row["version"]
     return CodeVersionDetail(
-        version=row["version"],
+        version=tool_version,
         created_at=datetime.fromisoformat(row["created_at"]),
         author=row["author"],
         note=row["note"],
         code=row["code"],
         pip_packages=json.loads(row["pip_packages"] or "[]"),
         origin_run_id=row["origin_run_id"],
-        params=_parse_param_specs(row["params_model"] if "params_model" in row.keys() else None),
-        required_files=_parse_file_requirements(row["required_files"] if "required_files" in row.keys() else None),
+        params=_parse_param_specs(params_payload),
+        required_files=_parse_file_requirements(files_payload),
+        record_id=row["version"],
     )
 
 
 def _row_to_code_version_summary(row: sqlite3.Row) -> CodeVersionSummary:
+    tool_version = row["tool_version"] if "tool_version" in row.keys() else None
+    if tool_version is None:
+        tool_version = row["version"]
     return CodeVersionSummary(
-        version=row["version"],
+        version=tool_version,
         created_at=datetime.fromisoformat(row["created_at"]),
         author=row["author"],
         note=row["note"],
+        record_id=row["version"],
     )
 
 
-def _ensure_current_code_version() -> CodeVersionDetail:
-    _ensure_initial_code_version()
+def _ensure_current_code_version(tool_id: int) -> CodeVersionDetail:
+    return _ensure_initial_code_version_for_tool(tool_id)
+
+
+def _get_code_version_detail(tool_id: int, version: int) -> CodeVersionDetail:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     try:
         row = connection.execute(
             """
-            SELECT version, created_at, author, note, code, pip_packages, origin_run_id, params_model, required_files
+            SELECT version, tool_id, tool_version, created_at, author, note, code, pip_packages, origin_run_id, params_model, required_files
             FROM code_versions
-            ORDER BY version DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("Failed to load current code version")
-        return _row_to_code_version_detail(row)
-    finally:
-        connection.close()
-
-
-def _get_code_version_detail(version: int) -> CodeVersionDetail:
-    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    try:
-        row = connection.execute(
-            """
-            SELECT version, created_at, author, note, code, pip_packages, origin_run_id, params_model, required_files
-            FROM code_versions
-            WHERE version = ?
+            WHERE tool_id = ? AND tool_version = ?
             """,
-            (version,),
+            (tool_id, version),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Code version not found")
@@ -408,26 +407,27 @@ def _get_code_version_detail(version: int) -> CodeVersionDetail:
         connection.close()
 
 
-def _resolve_code_version_detail(payload: E2BTestRequest) -> CodeVersionDetail:
-    current_detail = _ensure_current_code_version()
+def _resolve_code_version_detail(tool_id: int, payload: E2BTestRequest) -> CodeVersionDetail:
+    current_detail = _ensure_current_code_version(tool_id)
     requested = payload.code_version
     if requested is not None and requested != current_detail.version:
-        return _get_code_version_detail(requested)
+        return _get_code_version_detail(tool_id, requested)
     return current_detail
 
 
-def _list_code_versions(limit: int = 50) -> list[CodeVersionSummary]:
+def _list_code_versions(tool_id: int, limit: int = 50) -> list[CodeVersionSummary]:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
             """
-            SELECT version, created_at, author, note
+            SELECT version, tool_version, created_at, author, note
             FROM code_versions
-            ORDER BY version DESC
+            WHERE tool_id = ?
+            ORDER BY tool_version DESC
             LIMIT ?
             """,
-            (limit,),
+            (tool_id, limit),
         ).fetchall()
         return [_row_to_code_version_summary(row) for row in rows]
     finally:
@@ -436,6 +436,7 @@ def _list_code_versions(limit: int = 50) -> list[CodeVersionSummary]:
 
 def _create_code_version(
     *,
+    tool_id: int,
     code: str,
     pip_packages: Sequence[str],
     author: str,
@@ -448,9 +449,17 @@ def _create_code_version(
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     try:
         connection.execute("PRAGMA foreign_keys = ON;")
+        connection.row_factory = sqlite3.Row
+        tool_version_row = connection.execute(
+            "SELECT COALESCE(MAX(tool_version), 0) + 1 AS next_version FROM code_versions WHERE tool_id = ?",
+            (tool_id,),
+        ).fetchone()
+        next_tool_version = int(tool_version_row["next_version"]) if tool_version_row else 1
         cursor = connection.execute(
             """
             INSERT INTO code_versions (
+                tool_id,
+                tool_version,
                 created_at,
                 author,
                 note,
@@ -459,9 +468,11 @@ def _create_code_version(
                 origin_run_id,
                 params_model,
                 required_files
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                tool_id,
+                next_tool_version,
                 _iso(now),
                 author,
                 note,
@@ -478,7 +489,7 @@ def _create_code_version(
         connection.close()
     if version is None:
         raise RuntimeError("Failed to create new code version")
-    return _get_code_version_detail(version)
+    return _get_code_version_detail(tool_id, next_tool_version)
 
 
 def _build_version_chat_message(
@@ -509,6 +520,7 @@ def _write_run_metadata(run_dir: Path, metadata: dict[str, object]) -> None:
 
 def _save_run_record(
     *,
+    tool_id: int,
     run_id: str,
     created_at: str,
     payload: E2BTestRequest,
@@ -516,7 +528,8 @@ def _save_run_record(
     run_dir: Path,
     persisted_files: Sequence[PersistedFile],
     logs_path: Path,
-    code_version: int,
+    code_version_label: int,
+    code_version_id: int | None,
 ) -> None:
     params_json = json.dumps(payload.params)
     pip_json = json.dumps(payload.pip_packages)
@@ -528,11 +541,20 @@ def _save_run_record(
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     try:
         connection.execute("PRAGMA foreign_keys = ON;")
+        if code_version_id is None:
+            lookup = connection.execute(
+                "SELECT version FROM code_versions WHERE tool_id = ? AND tool_version = ?",
+                (tool_id, code_version_label),
+            ).fetchone()
+            if lookup is None:
+                raise HTTPException(status_code=404, detail="Associated code version not found")
+            code_version_id = int(lookup["version"])
         try:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO e2b_runs (
                     id,
+                    tool_id,
                     created_at,
                     code_version,
                     params,
@@ -541,12 +563,13 @@ def _save_run_record(
                     ok,
                     error,
                     logs_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
+                    tool_id,
                     created_at,
-                    code_version,
+                    code_version_id,
                     params_json,
                     pip_json,
                     allow_internet,
@@ -559,14 +582,14 @@ def _save_run_record(
             logger.error(
                 "Failed to persist run %s (code_version=%s): %s",
                 run_id,
-                code_version,
+                code_version_id,
                 exc,
             )
             raise HTTPException(
                 status_code=500,
                 detail={
                     "message": "Unable to record run in history",
-                    "code_version": code_version,
+                    "code_version": code_version_label,
                     "error": str(exc),
                 },
             ) from exc
@@ -605,6 +628,7 @@ def _finalize_run_record(
     payload: E2BTestRequest,
     execution: SandboxExecutionResult,
     created_at: datetime,
+    tool_id: int,
 ) -> None:
     run_dir = execution.run_dir or (RUNS_ROOT / run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -619,6 +643,7 @@ def _finalize_run_record(
 
     metadata: dict[str, object] = {
         "run_id": run_id,
+        "tool_id": tool_id,
         "created_at": created_at.isoformat(),
         "code": payload.code,
         "params": payload.params,
@@ -630,6 +655,7 @@ def _finalize_run_record(
     _write_run_metadata(run_dir, metadata)
 
     _save_run_record(
+        tool_id=tool_id,
         run_id=run_id,
         created_at=_iso(created_at),
         payload=payload,
@@ -637,22 +663,28 @@ def _finalize_run_record(
         run_dir=run_dir,
         persisted_files=execution.persisted_files,
         logs_path=logs_path,
-        code_version=execution.code_version,
+        code_version_label=execution.code_version,
+        code_version_id=execution.code_version_id
+        if execution.code_version_id is not None
+        else execution.code_version,
     )
 
 
 def _execute_run(
     payload: E2BTestRequest,
     *,
+    tool_id: int,
     run_id: str,
     log_sink: LogSinkFn | None = None,
 ) -> SandboxExecutionResult:
-    version_detail = _resolve_code_version_detail(payload)
-    code_version = version_detail.version
+    version_detail = _resolve_code_version_detail(tool_id, payload)
+    code_version_label = version_detail.version
+    code_version_id = version_detail.record_id
     logger.info(
-        "Executing run %s using code_version=%s (requested=%s)",
+        "Executing run %s for tool %s using code_version=%s (requested=%s)",
         run_id,
-        code_version,
+        tool_id,
+        code_version_label,
         payload.code_version,
     )
     _validate_run_inputs(payload, version_detail)
@@ -661,12 +693,13 @@ def _execute_run(
         log_sink=log_sink,
         run_id=run_id,
         persist_root=RUNS_ROOT,
-        code_version=code_version,
+        code_version=code_version_label,
     )
     if execution.response.run_id is None:
         execution.response.run_id = run_id
     if execution.response.code_version is None:
-        execution.response.code_version = code_version
+        execution.response.code_version = code_version_label
+    execution.code_version_id = code_version_id
     return execution
 
 class RunFileResponse(BaseModel):
@@ -712,6 +745,7 @@ class CodeVersionSummary(BaseModel):
     created_at: datetime
     author: str
     note: str | None
+    record_id: int = Field(..., exclude=True)
 
 
 class CodeVersionDetail(CodeVersionSummary):
@@ -761,6 +795,7 @@ def init_storage() -> None:
 def init_db() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DATABASE_PATH, check_same_thread=False) as connection:
+        connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON;")
         connection.executescript(
             """
@@ -772,6 +807,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS code_versions (
                 version INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id INTEGER REFERENCES tools(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
                 author TEXT NOT NULL,
                 note TEXT,
@@ -794,6 +830,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS e2b_runs (
                 id TEXT PRIMARY KEY,
+                tool_id INTEGER REFERENCES tools(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
                 code_version INTEGER NOT NULL REFERENCES code_versions(version),
                 params TEXT NOT NULL,
@@ -813,9 +850,57 @@ def init_db() -> None:
             );
             """
         )
-        connection.commit()
 
-    _ensure_initial_code_version()
+        def _ensure_column(table: str, column: str, definition: str) -> None:
+            columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            if not any(col["name"] == column for col in columns):
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+        _ensure_column(
+            "code_versions",
+            "tool_id",
+            "INTEGER REFERENCES tools(id) ON DELETE CASCADE",
+        )
+        _ensure_column(
+            "code_versions",
+            "tool_version",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            "e2b_runs",
+            "tool_id",
+            "INTEGER REFERENCES tools(id) ON DELETE CASCADE",
+        )
+
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_code_versions_tool ON code_versions(tool_id, version)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_e2b_runs_tool ON e2b_runs(tool_id, created_at DESC)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_code_versions_tool_version ON code_versions(tool_id, tool_version)"
+        )
+
+        rows = connection.execute(
+            "SELECT version, tool_id FROM code_versions WHERE tool_version = 0 ORDER BY tool_id, version"
+        ).fetchall()
+        progress: dict[int, int] = {}
+        for row in rows:
+            tool_value = row["tool_id"]
+            if tool_value is None:
+                connection.execute(
+                    "UPDATE code_versions SET tool_version = ? WHERE version = ?",
+                    (row["version"], row["version"]),
+                )
+                continue
+            next_index = progress.get(tool_value, 0) + 1
+            connection.execute(
+                "UPDATE code_versions SET tool_version = ? WHERE version = ?",
+                (next_index, row["version"]),
+            )
+            progress[tool_value] = next_index
+        connection.commit()
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -825,6 +910,25 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
         yield connection
     finally:
         connection.close()
+
+
+def _ensure_tool_exists(tool_id: int, connection: sqlite3.Connection | None = None) -> None:
+    owns_connection = False
+    if connection is None:
+        connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON;")
+        owns_connection = True
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM tools WHERE id = ?",
+            (tool_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Tool not found")
+    finally:
+        if owns_connection:
+            connection.close()
 
 
 def row_to_tool(row: sqlite3.Row) -> Tool:
@@ -951,12 +1055,12 @@ async def run_tool_test() -> ToolTestPayload:
             detail="OPENAI_API_KEY is not configured on the server",
         )
 
-    system_prompt = (
-        "You are validating custom tools for the XLS workspace. When responding, "
-        "call the hello_world tool exactly once and use its output to greet the user."
-    )
-    messages: list[tuple[RoleLiteral, str]] = [
-        ("user", "Please greet me using the hello_world tool."),
+    system_prompt = "Call the provided tools whenever they help answer the user."
+    messages: list[ResponseInputItemParam] = [
+        {
+            "role": "user",
+            "content": "Use the hello_world tool once and share the greeting that it returns.",
+        },
     ]
 
     model_name = os.getenv("OPENAI_TOOL_TEST_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
@@ -971,9 +1075,9 @@ async def run_tool_test() -> ToolTestPayload:
             file_requirements,
             _params_present,
             _file_present,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
+            _prompt_tokens,
+            _completion_tokens,
+            _total_tokens,
             raw_text,
             executions,
         ) = await call_openai_responses(
@@ -987,21 +1091,11 @@ async def run_tool_test() -> ToolTestPayload:
         logger.exception("OpenAI tool test failed", exc_info=exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    usage_payload = (
-        jsonable_encoder(response.usage)
-        if response.usage is not None
-        else jsonable_encoder(
-            {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-            }
-        )
-    )
+    usage_payload = jsonable_encoder(response.usage) if response.usage is not None else None
 
     execution_details = [
         ToolExecutionPayload(
-            tool_call=jsonable_encoder(execution.tool_call),
+            tool_call=jsonable_encoder(execution),
             output=jsonable_encoder(execution.output),
         )
         for execution in executions
@@ -1021,26 +1115,27 @@ async def run_tool_test() -> ToolTestPayload:
 
 
 @app.post(
-    "/api/e2b-test",
+    "/api/tools/{tool_id}/e2b-test",
     response_model=E2BTestResponse,
     summary="Execute AI-authored Python inside an E2B sandbox",
 )
-def run_e2b_test(payload: E2BTestRequest) -> E2BTestResponse:
+def run_e2b_test(tool_id: int, payload: E2BTestRequest) -> E2BTestResponse:
     """Create a fresh E2B sandbox, seed the runner scaffolding, and execute the provided code."""
 
+    _ensure_tool_exists(tool_id)
     run_id = uuid4().hex
     created_at = datetime.now(timezone.utc)
-    execution = _execute_run(payload, run_id=run_id)
-    _finalize_run_record(run_id, payload, execution, created_at)
+    execution = _execute_run(payload, tool_id=tool_id, run_id=run_id)
+    _finalize_run_record(run_id, payload, execution, created_at, tool_id=tool_id)
     return execution.response
 
 
 @app.post(
-    "/api/e2b-chat",
+    "/api/tools/{tool_id}/e2b-chat",
     response_model=ChatCompletionResponse,
     summary="Generate sandbox code with the OpenAI Responses API",
 )
-async def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
+async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletionResponse:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(
@@ -1048,15 +1143,16 @@ async def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
             detail="OPENAI_API_KEY is not configured on the server",
         )
 
+    _ensure_tool_exists(tool_id)
     model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-    message_payload: list[tuple[RoleLiteral, str]] = []
+    message_payload: list[ResponseInputItemParam] = []
     for message in payload.messages:
         content = message.content.strip()
         if not content:
             continue
-        role: RoleLiteral = message.role  # ChatMessage enforces valid roles
-        message_payload.append((role, content))
+        role = message.role  # ChatMessage enforces valid roles
+        message_payload.append({ "role": role, "content": content })
 
     try:
         (
@@ -1082,7 +1178,7 @@ async def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
     except Exception as exc:  # pragma: no cover - network interaction
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    current_detail = _ensure_current_code_version()
+    current_detail = _ensure_current_code_version(tool_id)
 
     incoming_code = code_snippet.strip() if isinstance(code_snippet, str) else None
     update_pip = bool(pip_packages) or code_snippet is not None
@@ -1104,6 +1200,7 @@ async def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
 
     if changed:
         detail = _create_code_version(
+            tool_id=tool_id,
             code=target_code,
             pip_packages=target_pip_packages,
             author="assistant",
@@ -1152,39 +1249,51 @@ async def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
 
 
 @app.get(
-    "/api/e2b-code/current",
+    "/api/tools/{tool_id}/e2b-code/current",
     response_model=CodeVersionDetail,
     summary="Fetch the currently active code version",
 )
-def get_current_code_version() -> CodeVersionDetail:
-    return _ensure_current_code_version()
+def get_current_code_version(tool_id: int) -> CodeVersionDetail:
+    _ensure_tool_exists(tool_id)
+    return _ensure_current_code_version(tool_id)
 
 
 @app.get(
-    "/api/e2b-code/versions",
+    "/api/tools/{tool_id}/e2b-code/versions",
     response_model=list[CodeVersionSummary],
     summary="List recent code versions",
 )
-def list_code_versions(limit: int = Query(20, ge=1, le=200)) -> list[CodeVersionSummary]:
-    return _list_code_versions(limit)
+def list_code_versions(
+    tool_id: int,
+    limit: int = Query(20, ge=1, le=200),
+) -> list[CodeVersionSummary]:
+    _ensure_tool_exists(tool_id)
+    _ensure_initial_code_version_for_tool(tool_id)
+    return _list_code_versions(tool_id, limit)
 
 
 @app.get(
-    "/api/e2b-code/versions/{version}",
+    "/api/tools/{tool_id}/e2b-code/versions/{version}",
     response_model=CodeVersionDetail,
     summary="Fetch a specific code version",
 )
-def get_code_version(version: int) -> CodeVersionDetail:
-    return _get_code_version_detail(version)
+def get_code_version(tool_id: int, version: int) -> CodeVersionDetail:
+    _ensure_tool_exists(tool_id)
+    return _get_code_version_detail(tool_id, version)
 
 
 @app.post(
-    "/api/e2b-code/versions",
+    "/api/tools/{tool_id}/e2b-code/versions",
     response_model=CodeVersionUpdateResponse,
     summary="Create a new manual code version",
 )
-def create_code_version_endpoint(request: CodeVersionUpdateRequest) -> CodeVersionUpdateResponse:
+def create_code_version_endpoint(
+    tool_id: int,
+    request: CodeVersionUpdateRequest,
+) -> CodeVersionUpdateResponse:
+    _ensure_tool_exists(tool_id)
     detail = _create_code_version(
+        tool_id=tool_id,
         code=request.code,
         pip_packages=request.pip_packages,
         author="user",
@@ -1202,13 +1311,15 @@ def create_code_version_endpoint(request: CodeVersionUpdateRequest) -> CodeVersi
 
 
 @app.post(
-    "/api/e2b-code/revert",
+    "/api/tools/{tool_id}/e2b-code/revert",
     response_model=CodeVersionUpdateResponse,
     summary="Create a new code version by reverting to a previous one",
 )
-def revert_code_version(request: CodeVersionRevertRequest) -> CodeVersionUpdateResponse:
-    base_detail = _get_code_version_detail(request.version)
+def revert_code_version(tool_id: int, request: CodeVersionRevertRequest) -> CodeVersionUpdateResponse:
+    _ensure_tool_exists(tool_id)
+    base_detail = _get_code_version_detail(tool_id, request.version)
     detail = _create_code_version(
+        tool_id=tool_id,
         code=base_detail.code,
         pip_packages=base_detail.pip_packages,
         author="user",
@@ -1227,12 +1338,13 @@ def revert_code_version(request: CodeVersionRevertRequest) -> CodeVersionUpdateR
 
 
 @app.post(
-    "/api/e2b-test/stream",
+    "/api/tools/{tool_id}/e2b-test/stream",
     summary="Stream E2B sandbox execution logs in real time",
 )
-async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
+async def run_e2b_test_stream(tool_id: int, payload: E2BTestRequest) -> StreamingResponse:
     """Start a sandbox run and emit newline-delimited JSON events as it progresses."""
 
+    _ensure_tool_exists(tool_id)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[str] = asyncio.Queue()
     run_id = uuid4().hex
@@ -1248,10 +1360,10 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
 
     def _worker() -> None:
         try:
-            execution = _execute_run(payload, run_id=run_id, log_sink=_log_sink)
+            execution = _execute_run(payload, tool_id=tool_id, run_id=run_id, log_sink=_log_sink)
             result = execution.response
             _enqueue({"type": "result", "data": result.model_dump()})
-            _finalize_run_record(run_id, payload, execution, created_at)
+            _finalize_run_record(run_id, payload, execution, created_at, tool_id=tool_id)
         except HTTPException as http_exc:  # propagate structured error
             _enqueue({"type": "error", "status": http_exc.status_code, "detail": http_exc.detail})
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -1276,10 +1388,25 @@ async def run_e2b_test_stream(payload: E2BTestRequest) -> StreamingResponse:
     return StreamingResponse(_event_stream(), media_type="application/jsonlines")
 
 
-@app.get("/api/e2b-runs", response_model=list[RunSummaryResponse], summary="List sandbox runs")
-def list_e2b_runs(connection: sqlite3.Connection = Depends(get_db)) -> list[RunSummaryResponse]:
+@app.get(
+    "/api/tools/{tool_id}/e2b-runs",
+    response_model=list[RunSummaryResponse],
+    summary="List sandbox runs",
+)
+def list_e2b_runs(
+    tool_id: int,
+    connection: sqlite3.Connection = Depends(get_db),
+) -> list[RunSummaryResponse]:
+    _ensure_tool_exists(tool_id, connection)
     rows = connection.execute(
-        "SELECT id, created_at, ok, error, code_version FROM e2b_runs ORDER BY created_at DESC"
+        """
+        SELECT r.id, r.created_at, r.ok, r.error, v.tool_version
+        FROM e2b_runs AS r
+        JOIN code_versions AS v ON r.code_version = v.version
+        WHERE r.tool_id = ?
+        ORDER BY r.created_at DESC
+        """,
+        (tool_id,),
     ).fetchall()
 
     summaries: list[RunSummaryResponse] = []
@@ -1287,31 +1414,51 @@ def list_e2b_runs(connection: sqlite3.Connection = Depends(get_db)) -> list[RunS
         created_at = datetime.fromisoformat(row["created_at"])
         ok_value = row["ok"]
         ok_bool = None if ok_value is None else bool(ok_value)
+        tool_version_value = row["tool_version"]
+        if tool_version_value is None:
+            continue
+        code_version_label = int(tool_version_value)
         summaries.append(
             RunSummaryResponse(
                 id=row["id"],
                 created_at=created_at,
                 ok=ok_bool,
                 error=row["error"],
-                code_version=row["code_version"],
+                code_version=code_version_label,
             )
         )
     return summaries
 
 
 @app.get(
-    "/api/e2b-runs/{run_id}",
+    "/api/tools/{tool_id}/e2b-runs/{run_id}",
     response_model=RunDetailResponse,
     summary="Fetch sandbox run details",
 )
-def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -> RunDetailResponse:
+def get_e2b_run(
+    tool_id: int,
+    run_id: str,
+    connection: sqlite3.Connection = Depends(get_db),
+) -> RunDetailResponse:
+    _ensure_tool_exists(tool_id, connection)
     run_row = connection.execute(
         """
-        SELECT id, created_at, code_version, params, pip_packages, allow_internet, ok, error, logs_path
-        FROM e2b_runs
-        WHERE id = ?
+        SELECT
+            r.id,
+            r.created_at,
+            r.code_version AS code_version_id,
+            r.params,
+            r.pip_packages,
+            r.allow_internet,
+            r.ok,
+            r.error,
+            r.logs_path,
+            v.tool_version
+        FROM e2b_runs AS r
+        JOIN code_versions AS v ON r.code_version = v.version
+        WHERE r.id = ? AND r.tool_id = ?
         """,
-        (run_id,),
+        (run_id, tool_id),
     ).fetchone()
 
     if run_row is None:
@@ -1324,8 +1471,11 @@ def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -
     ok_value = run_row["ok"]
     ok_bool = None if ok_value is None else bool(ok_value)
     error_text = run_row["error"]
-    code_version = run_row["code_version"]
-    code_detail = _get_code_version_detail(code_version)
+    tool_version_value = run_row["tool_version"]
+    if tool_version_value is None:
+        raise HTTPException(status_code=404, detail="Associated code version not found")
+    code_version = int(tool_version_value)
+    code_detail = _get_code_version_detail(tool_id, code_version)
 
     run_dir = RUNS_ROOT / run_id
     logs_relative = run_row["logs_path"] or "logs.txt"
@@ -1348,7 +1498,7 @@ def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -
     for file_row in files_rows:
         local_path = file_row["local_path"]
         download_url = (
-            f"/api/e2b-runs/{run_id}/file?path="
+            f"/api/tools/{tool_id}/e2b-runs/{run_id}/file?path="
             f"{urllib.parse.quote(local_path, safe='')}"
         )
         files.append(
@@ -1376,10 +1526,22 @@ def get_e2b_run(run_id: str, connection: sqlite3.Connection = Depends(get_db)) -
 
 
 @app.get(
-    "/api/e2b-runs/{run_id}/file",
+    "/api/tools/{tool_id}/e2b-runs/{run_id}/file",
     summary="Download a file generated by a sandbox run",
 )
-def download_e2b_run_file(run_id: str, path: str = Query(..., description="Relative file path")) -> FileResponse:
+def download_e2b_run_file(
+    tool_id: int,
+    run_id: str,
+    path: str = Query(..., description="Relative file path"),
+    connection: sqlite3.Connection = Depends(get_db),
+) -> FileResponse:
+    _ensure_tool_exists(tool_id, connection)
+    run_exists = connection.execute(
+        "SELECT 1 FROM e2b_runs WHERE id = ? AND tool_id = ?",
+        (run_id, tool_id),
+    ).fetchone()
+    if run_exists is None:
+        raise HTTPException(status_code=404, detail="Run not found")
     run_dir = RUNS_ROOT / run_id
     target = _resolve_run_file(run_dir, path)
     if not target.is_file():
@@ -1388,21 +1550,21 @@ def download_e2b_run_file(run_id: str, path: str = Query(..., description="Relat
 
 
 @app.delete(
-    "/api/e2b-runs/{run_id}",
+    "/api/tools/{tool_id}/e2b-runs/{run_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a sandbox run",
 )
-def delete_e2b_run(run_id: str) -> Response:
-    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    try:
-        connection.execute("PRAGMA foreign_keys = ON;")
-        cursor = connection.execute(
-            "DELETE FROM e2b_runs WHERE id = ?",
-            (run_id,),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+def delete_e2b_run(
+    tool_id: int,
+    run_id: str,
+    connection: sqlite3.Connection = Depends(get_db),
+) -> Response:
+    _ensure_tool_exists(tool_id, connection)
+    cursor = connection.execute(
+        "DELETE FROM e2b_runs WHERE id = ? AND tool_id = ?",
+        (run_id, tool_id),
+    )
+    connection.commit()
 
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1459,7 +1621,9 @@ def create_tool(connection: sqlite3.Connection = Depends(get_db)) -> Tool:
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=500, detail="Failed to load created tool")
-    return row_to_tool(row)
+    tool = row_to_tool(row)
+    _ensure_initial_code_version_for_tool(tool.id)
+    return tool
 
 
 @app.patch(

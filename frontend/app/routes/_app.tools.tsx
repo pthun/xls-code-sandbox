@@ -188,6 +188,19 @@ export default function ToolLayout() {
             >
               Manage sample files
             </NavLink>
+            <NavLink
+              to="script"
+              className={({ isActive }) =>
+                cn(
+                  "block rounded-md px-3 py-2 text-sm transition",
+                  isActive
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent/40"
+                )
+              }
+            >
+              Create script
+            </NavLink>
           </nav>
         </div>
 
