@@ -1181,6 +1181,7 @@ async def run_tool_test() -> ToolTestPayload:
             raw_text,
             executions,
         ) = await call_openai_responses(
+            tool_id=0,
             api_key=api_key,
             system_prompt=system_prompt,
             messages=messages,
@@ -1278,6 +1279,7 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
             raw_text,
             _executed_tools,
         ) = await call_openai_responses(
+            tool_id=tool_id,
             api_key=api_key,
             system_prompt=system_prompt,
             messages=message_payload,

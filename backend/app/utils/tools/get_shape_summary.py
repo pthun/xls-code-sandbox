@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Any
 
 from pydantic import BaseModel, Field, model_validator
 from openai.types.responses import FunctionToolParam
@@ -25,7 +25,6 @@ MAX_SAMPLE_ROWS = 5
 class CsvFileArgs(BaseModel):
     """Arguments accepted by the get_shape_summary tool."""
 
-    tool_id: int = Field(..., ge=1, description="Identifier of the tool that owns the file.")
     path: str | None = Field(
         default=None,
         description="Absolute or relative path to the CSV file inside the uploads directory.",
@@ -124,13 +123,13 @@ def _summarise_csv(record: ToolFileRecord) -> CsvShapeSummary:
 
 
 async def _execute_get_shape_summary(
-    *, arguments: Optional[Mapping[str, Any]] = None
+    *, tool_id: int, arguments: Optional[Mapping[str, Any]] = None
 ) -> ToolExecutionResult:
     args = CsvFileArgs.model_validate(arguments or {})
 
     try:
         record = resolve_tool_file(
-            args.tool_id,
+            tool_id,
             file_id=args.file_id,
             path=args.path,
         )

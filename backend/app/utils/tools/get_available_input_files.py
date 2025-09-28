@@ -15,8 +15,7 @@ from .registry import registry
 class GetAvailableInputFilesArgs(BaseModel):
     """Arguments accepted by the get_available_input_files tool."""
 
-    tool_id: int = Field(..., ge=1, description="Identifier of the tool to inspect.")
-
+    pass
 
 class AvailableInputFile(BaseModel):
     """Metadata about an uploaded input file."""
@@ -70,17 +69,17 @@ def _build_file_payload(record: ToolFileRecord) -> AvailableInputFile:
 
 
 async def _execute_get_available_input_files(
-    *, arguments: Optional[Mapping[str, Any]] = None
+    *, tool_id: int, arguments: Optional[Mapping[str, Any]] = None
 ) -> ToolExecutionResult:
-    args = GetAvailableInputFilesArgs.model_validate(arguments or {})
+    _args = GetAvailableInputFilesArgs.model_validate(arguments or {})
 
     try:
-        records = list_tool_files(args.tool_id)
+        records = list_tool_files(tool_id)
     except ToolNotFoundError as exc:
         return ToolExecutionResult(success=False, output="{}", error=str(exc))
 
     payload = GetAvailableInputFilesResult(
-        tool_id=args.tool_id,
+        tool_id=tool_id,
         files=[_build_file_payload(record) for record in records],
     )
 

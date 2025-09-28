@@ -59,7 +59,9 @@ HELLO_WORLD_DEFINITION: FunctionToolParam = FunctionToolParam(
 # ——————————————————————————————————————————————————————————————
 # Executor
 # ——————————————————————————————————————————————————————————————
-async def _execute_hello_world(*, arguments: Optional[Mapping[str, Any]] = None) -> ToolExecutionResult:
+async def _execute_hello_world(
+    *, tool_id: int, arguments: Optional[Mapping[str, Any]] = None
+) -> ToolExecutionResult:
     """Execute the hello_world tool and produce a Responses-compliant result.
 
     Steps:

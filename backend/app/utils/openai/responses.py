@@ -23,12 +23,14 @@ from ..tools.registry import registry as tool_registry
 
 async def call_openai_responses(
     *,
+    tool_id: int,
     api_key: str,
     system_prompt: str,
     messages: list[ResponseInputItemParam],
     model_name: str,
     tool_names: list[str] | None = None,
     max_tool_iterations: int = 3,
+    parse_structured_tags: bool = True,
 ) -> tuple[
     Response,
     str,
@@ -61,7 +63,6 @@ async def call_openai_responses(
 
     client = AsyncOpenAI(api_key=api_key)
     history = messages
-    print(history)
 
     available_tools: list[FunctionToolParam] = []
     tool_handlers: dict[str, ResponseTool] = {}
@@ -89,7 +90,6 @@ async def call_openai_responses(
         )
 
         tool_calls = [output for output in response.output if output.type == "function_call"]
-        print("Tool calls:", tool_calls)
         if not tool_calls:
             history.append({
                 "role": "assistant",
@@ -107,7 +107,7 @@ async def call_openai_responses(
             arguments_raw = call.arguments
             arguments = json.loads(arguments_raw)
 
-            execution = await tool.invoke(arguments=arguments)
+            execution = await tool.invoke(tool_id=tool_id, arguments=arguments)
             if not execution.success:
                 print(f"Tool '{tool.name}' execution failed: {execution.error}")
 
@@ -127,18 +127,28 @@ async def call_openai_responses(
         raise RuntimeError("Failed to obtain a response from OpenAI")
 
     raw_text = _extract_text(response)
-    code_blocks = _extract_tagged_blocks(raw_text, "CodeOutput")
-    pip_blocks = _extract_tagged_blocks(raw_text, "Pip")
-    params_blocks = _extract_tagged_blocks(raw_text, "Params")
-    file_blocks = _extract_tagged_blocks(raw_text, "FileList")
 
-    code = code_blocks[-1] if code_blocks else None
-    pip_packages = _split_packages(pip_blocks)
-    params_present = bool(params_blocks)
-    file_present = bool(file_blocks)
-    params_model = _parse_json_array(params_blocks[-1] if params_blocks else None)
-    file_requirements = _parse_json_array(file_blocks[-1] if file_blocks else None)
-    display_text = _strip_tags(raw_text, ("CodeOutput", "Pip", "Params", "FileList"))
+    if parse_structured_tags:
+        code_blocks = _extract_tagged_blocks(raw_text, "CodeOutput")
+        pip_blocks = _extract_tagged_blocks(raw_text, "Pip")
+        params_blocks = _extract_tagged_blocks(raw_text, "Params")
+        file_blocks = _extract_tagged_blocks(raw_text, "FileList")
+
+        code = code_blocks[-1] if code_blocks else None
+        pip_packages = _split_packages(pip_blocks)
+        params_present = bool(params_blocks)
+        file_present = bool(file_blocks)
+        params_model = _parse_json_array(params_blocks[-1] if params_blocks else None)
+        file_requirements = _parse_json_array(file_blocks[-1] if file_blocks else None)
+        display_text = _strip_tags(raw_text, ("CodeOutput", "Pip", "Params", "FileList"))
+    else:
+        code = None
+        pip_packages: list[str] = []
+        params_present = False
+        file_present = False
+        params_model: list[dict[str, Any]] = []
+        file_requirements: list[dict[str, Any]] = []
+        display_text = raw_text.strip()
 
     usage: ResponseUsage | None = response.usage
     prompt_tokens = usage.input_tokens if usage else None

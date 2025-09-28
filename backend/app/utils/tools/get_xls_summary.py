@@ -36,7 +36,6 @@ MAX_SAMPLE_ROWS = 5
 class SpreadsheetFileArgs(BaseModel):
     """Arguments accepted by the get_xls_summary tool."""
 
-    tool_id: int = Field(..., ge=1, description="Identifier of the tool that owns the spreadsheet.")
     path: str | None = Field(
         default=None,
         description="Absolute or relative path to the spreadsheet inside the uploads directory.",
@@ -258,13 +257,13 @@ def _summarise_xls(record: ToolFileRecord) -> SpreadsheetSummary:
 
 
 async def _execute_get_xls_summary(
-    *, arguments: Optional[Mapping[str, Any]] = None
+    *, tool_id: int, arguments: Optional[Mapping[str, Any]] = None
 ) -> ToolExecutionResult:
     args = SpreadsheetFileArgs.model_validate(arguments or {})
 
     try:
         record = resolve_tool_file(
-            args.tool_id,
+            tool_id,
             file_id=args.file_id,
             path=args.path,
         )

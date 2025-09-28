@@ -14,7 +14,10 @@ class ToolExecutor(Protocol):
     """Protocol for async callables that execute a tool."""
 
     async def __call__(
-        self, *, arguments: dict[str, Any] | None = None
+        self,
+        *,
+        tool_id: int,
+        arguments: dict[str, Any] | None = None,
     ) -> "ToolExecutionResult":
         """Execute the tool with optional arguments and return a structured result."""
 
@@ -34,11 +37,16 @@ class ResponseTool:
     definition: FunctionToolParam
     executor: ToolExecutor
 
-    async def invoke(self, *, arguments: dict[str, Any] | None = None) -> ToolExecutionResult:
+    async def invoke(
+        self,
+        *,
+        tool_id: int,
+        arguments: dict[str, Any] | None = None,
+    ) -> ToolExecutionResult:
         """Execute the tool and return the captured result."""
 
         payload = arguments or {}
-        result = await self.executor(arguments=payload)
+        result = await self.executor(tool_id=tool_id, arguments=payload)
         return result
 
     def as_param(self) -> FunctionToolParam:
