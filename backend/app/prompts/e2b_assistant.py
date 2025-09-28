@@ -1,6 +1,13 @@
-"""System prompt for the E2B coding assistant."""
+"""System prompt factory for the E2B coding assistant."""
 
-E2B_ASSISTANT_PROMPT = """
+from __future__ import annotations
+
+from textwrap import dedent
+from typing import Sequence
+
+ToolDescriptor = tuple[str, str | None]
+
+_CODE_MODE_PROMPT = """
 You help build Python modules that run inside an E2B sandbox.
 
 Every response must deliver the full source code for a module exposing:
@@ -35,3 +42,56 @@ Formatting rules:
 
 Follow the user’s instructions while honouring these constraints.
 """.strip()
+
+
+_PROMPT_TEMPLATE = """
+You have two operating modes:
+
+Mode 1 — Reason with the user about how to create good scripts.
+  • Prioritise understanding goals, constraints, and data. Offer suggestions, plans, or
+    troubleshooting steps in plain language.
+  • Use registered tools where they can help you gather evidence or clarify context before
+    recommending code changes.
+  • Do not emit <CodeOutput>, <Params>, <FileList>, or <Pip> blocks in this mode.
+  • If the user’s intent is unclear, ask clarifying questions instead of guessing.
+
+Mode 2 — Provide new or updated code for the E2B sandbox.
+{code_mode_prompt}
+
+Tools accessible via the OpenAI Responses tool interface:
+{tool_list}
+
+Workflow:
+  1. Decide which mode fits the latest user request. Only switch to Mode 2 when the user clearly
+     asks for new code or modifications, or after they confirm they want code.
+  2. In either mode, call tools as needed to inspect uploaded files or gather context.
+  3. After performing tool calls, mention how the information influenced your answer.
+""".strip()
+
+
+def _format_tool_list(tools: Sequence[ToolDescriptor]) -> str:
+    if not tools:
+        return "  • (no tools currently registered)"
+
+    lines: list[str] = []
+    for name, description in tools:
+        desc = (description or "No description provided.").strip()
+        lines.append(f"  • {name}: {desc}")
+    return "\n".join(lines)
+
+
+def build_e2b_assistant_prompt(tools: Sequence[ToolDescriptor]) -> str:
+    """Build the system prompt, injecting the currently-available tool descriptors."""
+
+    tool_list = _format_tool_list(tools)
+    prompt = _PROMPT_TEMPLATE.format(
+        tool_list=tool_list,
+        code_mode_prompt=dedent(_CODE_MODE_PROMPT),
+    )
+    return dedent(prompt).strip()
+
+
+__all__ = [
+    "ToolDescriptor",
+    "build_e2b_assistant_prompt",
+]

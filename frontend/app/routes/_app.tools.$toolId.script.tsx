@@ -1,5 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { useOutletContext } from "react-router";
+import { Link, useOutletContext } from "react-router";
 import {
   ChevronDown,
   ChevronUp,
@@ -1580,6 +1580,48 @@ export default function CreateScriptView() {
       </div>
 
       <aside className="w-full space-y-4 lg:w-80 lg:shrink-0">
+        <Card>
+          <CardHeader className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle>Sample files</CardTitle>
+              <CardDescription>
+                These files are available to your sandbox during runs.
+              </CardDescription>
+            </div>
+            <Button asChild size="sm" variant="ghost">
+              <Link to="../files">Manage</Link>
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {tool.files.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No files uploaded yet. Add sample data from the manage files page.
+              </p>
+            ) : (
+              <ul className="space-y-2 text-sm">
+                {tool.files.map((file) => (
+                  <li
+                    key={file.id}
+                    className="rounded-md border border-border bg-muted/20 px-3 py-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate font-medium" title={file.original_filename}>
+                        {file.original_filename}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {formatBytes(file.size_bytes)}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Uploaded {new Date(file.uploaded_at).toLocaleString()}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
         <Card>
           <CardHeader className="flex items-center justify-between gap-2">
             <div>

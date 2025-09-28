@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic.config import ConfigDict
 from openai.types.responses import ResponseInputItemParam
 
-from .prompts.e2b_assistant import E2B_ASSISTANT_PROMPT
+from .prompts.e2b_assistant import build_e2b_assistant_prompt
 from .utils.e2b import (
     E2BTestRequest,
     E2BTestResponse,
@@ -35,7 +35,7 @@ from .utils.e2b import (
 from .utils.openai import (
     call_openai_responses,
 )
-from .utils.tools import registry as tool_registry
+from .utils.tools import ResponseTool, registry as tool_registry
 from .utils.misc.typeguards import is_any_list
 
 dotenv.load_dotenv()
@@ -119,7 +119,7 @@ class ChatRequest(BaseModel):
 
 
 class ChatHistoryUpdateRequest(BaseModel):
-    messages: list[StoredChatMessage] = Field(default_factory=list)
+    messages: list[StoredChatMessage] = Field(default_factory=lambda: [])
 
 
 class StoredChatMessage(BaseModel):
@@ -1257,6 +1257,11 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
         role = message.role  # ChatMessage enforces valid roles
         message_payload.append({ "role": role, "content": content })
 
+    available_tools = list(tool_registry.values())
+    tool_names = [tool.name for tool in available_tools]
+    tool_descriptors = [_tool_descriptor(tool) for tool in available_tools]
+    system_prompt = build_e2b_assistant_prompt(tool_descriptors)
+
     try:
         (
             _response,
@@ -1274,9 +1279,10 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
             _executed_tools,
         ) = await call_openai_responses(
             api_key=api_key,
-            system_prompt=E2B_ASSISTANT_PROMPT,
+            system_prompt=system_prompt,
             messages=message_payload,
             model_name=model_name,
+            tool_names=tool_names,
         )
     except Exception as exc:  # pragma: no cover - network interaction
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1964,3 +1970,18 @@ try:
     import xlrd  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover
     xlrd = None
+def _tool_descriptor(tool: ResponseTool) -> tuple[str, str | None]:
+    """Return a human-friendly (name, description) pair for a registered tool."""
+
+    definition = tool.definition
+    description = getattr(definition, "description", None)
+    if description is None:
+        function_payload = getattr(definition, "function", None)
+        if function_payload is not None:
+            if isinstance(function_payload, dict):
+                description = function_payload.get("description")
+            else:
+                description = getattr(function_payload, "description", None)
+    if description is not None:
+        description = str(description)
+    return tool.name, description
