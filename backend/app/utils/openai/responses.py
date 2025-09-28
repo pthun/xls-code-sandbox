@@ -91,7 +91,10 @@ async def call_openai_responses(
         tool_calls = [output for output in response.output if output.type == "function_call"]
         print("Tool calls:", tool_calls)
         if not tool_calls:
-            #history.append(response.output)
+            history.append({
+                "role": "assistant",
+                "content": response.output_text
+            })
             break # Finished tool calling iterations, proceed to parsing output
 
         for call in tool_calls:
