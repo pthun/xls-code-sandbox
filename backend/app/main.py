@@ -12,12 +12,13 @@ import urllib.parse
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator, Literal, Sequence
+from typing import Any, Callable, Generator, Literal, Sequence, cast
 from uuid import uuid4
 
 import dotenv
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
@@ -30,7 +31,12 @@ from .utils.e2b import (
     SandboxExecutionResult,
     execute_e2b_test,
 )
-from .utils.openai import RoleLiteral, call_openai_responses
+from .utils.openai import (
+    RoleLiteral,
+    call_openai_responses,
+)
+from .utils.tools import registry as tool_registry
+from .utils.misc.typeguards import is_any_list
 
 dotenv.load_dotenv()
 
@@ -43,6 +49,13 @@ ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
 
 logger = logging.getLogger(__name__)
+
+
+LogSinkFn = Callable[[list[str]], None]
+
+
+ParamMetadata = dict[str, object]
+FileMetadata = dict[str, object]
 
 
 class DoubleRequest(BaseModel):
@@ -83,7 +96,7 @@ class ToolFile(BaseModel):
 
 
 class ToolDetail(Tool):
-    files: list[ToolFile] = Field(default_factory=list)
+    files: list[ToolFile] = Field(default_factory=lambda: [])
 
 
 class ToolUpdateRequest(BaseModel):
@@ -123,8 +136,29 @@ class ChatCompletionResponse(BaseModel):
     usage: ChatUsage | None = None
     raw: str | None = None
     version: int | None = None
-    params: list[dict[str, Any]] = Field(default_factory=list)
-    required_files: list[dict[str, Any]] = Field(default_factory=list)
+    params: list[ParamMetadata] = Field(default_factory=lambda: [])
+    required_files: list[FileMetadata] = Field(default_factory=lambda: [])
+
+
+class ToolExecutionPayload(BaseModel):
+    """Captured execution details for a tool call."""
+
+    tool_call: dict[str, Any]
+    output: dict[str, Any]
+
+
+class ToolTestPayload(BaseModel):
+    """Serialized payload returned by the hello world tool test endpoint."""
+
+    tool: dict[str, Any]
+    assistant_text: str
+    response: dict[str, Any]
+    usage: dict[str, Any] | None = None
+    raw_text: str
+    pip_packages: list[str] = Field(default_factory=list)
+    params: list[ParamMetadata] = Field(default_factory=list)
+    required_files: list[FileMetadata] = Field(default_factory=list)
+    executions: list[ToolExecutionPayload] = Field(default_factory=list)
 
 
 def _usage_from_tokens(
@@ -187,8 +221,10 @@ def _parse_param_specs(value: str | None) -> list[ParamSpec]:
         return []
 
     specs: list[ParamSpec] = []
-    if isinstance(raw, list):
+    if is_any_list(raw):
         for item in raw:
+            if not isinstance(item, dict):
+                continue
             try:
                 specs.append(ParamSpec.model_validate(item))
             except ValidationError:
@@ -205,8 +241,10 @@ def _parse_file_requirements(value: str | None) -> list[FileRequirement]:
         return []
 
     files: list[FileRequirement] = []
-    if isinstance(raw, list):
+    if is_any_list(raw):
         for item in raw:
+            if not isinstance(item, dict):
+                continue
             try:
                 files.append(FileRequirement.model_validate(item))
             except ValidationError:
@@ -214,7 +252,7 @@ def _parse_file_requirements(value: str | None) -> list[FileRequirement]:
     return files
 
 
-def _coerce_param_specs(items: Sequence[dict[str, Any]]) -> list[ParamSpec]:
+def _coerce_param_specs(items: Sequence[ParamMetadata]) -> list[ParamSpec]:
     specs: list[ParamSpec] = []
     for item in items:
         try:
@@ -224,7 +262,7 @@ def _coerce_param_specs(items: Sequence[dict[str, Any]]) -> list[ParamSpec]:
     return specs
 
 
-def _coerce_file_requirements(items: Sequence[dict[str, Any]]) -> list[FileRequirement]:
+def _coerce_file_requirements(items: Sequence[FileMetadata]) -> list[FileRequirement]:
     files: list[FileRequirement] = []
     for item in items:
         try:
@@ -234,12 +272,12 @@ def _coerce_file_requirements(items: Sequence[dict[str, Any]]) -> list[FileRequi
     return files
 
 
-def _params_to_dicts(items: Sequence[ParamSpec]) -> list[dict[str, Any]]:
-    return [item.model_dump() for item in items]
+def _params_to_dicts(items: Sequence[ParamSpec]) -> list[ParamMetadata]:
+    return [cast(ParamMetadata, item.model_dump()) for item in items]
 
 
-def _files_to_dicts(items: Sequence[FileRequirement]) -> list[dict[str, Any]]:
-    return [item.model_dump() for item in items]
+def _files_to_dicts(items: Sequence[FileRequirement]) -> list[FileMetadata]:
+    return [cast(FileMetadata, item.model_dump()) for item in items]
 
 
 def _param_matches_type(value: Any, expected: str) -> bool:
@@ -372,8 +410,9 @@ def _get_code_version_detail(version: int) -> CodeVersionDetail:
 
 def _resolve_code_version_detail(payload: E2BTestRequest) -> CodeVersionDetail:
     current_detail = _ensure_current_code_version()
-    if payload.code_version and payload.code_version != current_detail.version:
-        return _get_code_version_detail(payload.code_version)
+    requested = payload.code_version
+    if requested is not None and requested != current_detail.version:
+        return _get_code_version_detail(requested)
     return current_detail
 
 
@@ -437,6 +476,8 @@ def _create_code_version(
         connection.commit()
     finally:
         connection.close()
+    if version is None:
+        raise RuntimeError("Failed to create new code version")
     return _get_code_version_detail(version)
 
 
@@ -460,7 +501,7 @@ def _build_version_chat_message(
         files_json = json.dumps(_files_to_dicts(version.required_files), indent=2)
         lines.append("<FileList>\n" + files_json + "\n</FileList>")
     return "\n".join(lines)
-def _write_run_metadata(run_dir: Path, metadata: dict[str, Any]) -> None:
+def _write_run_metadata(run_dir: Path, metadata: dict[str, object]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = run_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
@@ -480,7 +521,7 @@ def _save_run_record(
     params_json = json.dumps(payload.params)
     pip_json = json.dumps(payload.pip_packages)
     allow_internet = 1 if payload.allow_internet else 0
-    ok_value = None if response.ok is None else int(bool(response.ok))
+    ok_value = int(bool(response.ok))
     error_text = response.error
     logs_relative = str(logs_path.relative_to(run_dir))
 
@@ -576,7 +617,7 @@ def _finalize_run_record(
             encoding="utf-8",
         )
 
-    metadata = {
+    metadata: dict[str, object] = {
         "run_id": run_id,
         "created_at": created_at.isoformat(),
         "code": payload.code,
@@ -604,7 +645,7 @@ def _execute_run(
     payload: E2BTestRequest,
     *,
     run_id: str,
-    log_sink=None,
+    log_sink: LogSinkFn | None = None,
 ) -> SandboxExecutionResult:
     version_detail = _resolve_code_version_detail(payload)
     code_version = version_detail.version
@@ -685,8 +726,8 @@ class CodeVersionUpdateRequest(BaseModel):
     code: str = Field(..., min_length=1)
     pip_packages: list[str] = Field(default_factory=list)
     note: str | None = None
-    params: list[ParamSpec] = Field(default_factory=list)
-    required_files: list[FileRequirement] = Field(default_factory=list)
+    params: list[ParamSpec] = Field(default_factory=lambda: [])
+    required_files: list[FileRequirement] = Field(default_factory=lambda: [])
 
 
 class CodeVersionRevertRequest(BaseModel):
@@ -892,6 +933,93 @@ def double_number(payload: DoubleRequest) -> DoubleResponse:
     )
 
 
+@app.get(
+    "/api/tool-test",
+    response_model=ToolTestPayload,
+    summary="Invoke the built-in hello world tool",
+)
+async def run_tool_test() -> ToolTestPayload:
+    """Execute the hello world tool and expose its Responses artefacts."""
+
+    tool = tool_registry.get("hello_world")
+    tool_definition = jsonable_encoder(tool.definition)
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not configured on the server",
+        )
+
+    system_prompt = (
+        "You are validating custom tools for the XLS workspace. When responding, "
+        "call the hello_world tool exactly once and use its output to greet the user."
+    )
+    messages: list[tuple[RoleLiteral, str]] = [
+        ("user", "Please greet me using the hello_world tool."),
+    ]
+
+    model_name = os.getenv("OPENAI_TOOL_TEST_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+
+    try:
+        (
+            response,
+            display_text,
+            _code,
+            pip_packages,
+            params_model,
+            file_requirements,
+            _params_present,
+            _file_present,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            raw_text,
+            executions,
+        ) = await call_openai_responses(
+            api_key=api_key,
+            system_prompt=system_prompt,
+            messages=messages,
+            model_name=model_name,
+            tool_names=[tool.name],
+        )
+    except Exception as exc:  # pragma: no cover - network interaction
+        logger.exception("OpenAI tool test failed", exc_info=exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    usage_payload = (
+        jsonable_encoder(response.usage)
+        if response.usage is not None
+        else jsonable_encoder(
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+        )
+    )
+
+    execution_details = [
+        ToolExecutionPayload(
+            tool_call=jsonable_encoder(execution.tool_call),
+            output=jsonable_encoder(execution.output),
+        )
+        for execution in executions
+    ]
+
+    return ToolTestPayload(
+        tool=tool_definition,
+        assistant_text=display_text,
+        response=jsonable_encoder(response),
+        usage=usage_payload,
+        raw_text=raw_text,
+        pip_packages=pip_packages,
+        params=params_model,
+        required_files=file_requirements,
+        executions=execution_details,
+    )
+
+
 @app.post(
     "/api/e2b-test",
     response_model=E2BTestResponse,
@@ -912,7 +1040,7 @@ def run_e2b_test(payload: E2BTestRequest) -> E2BTestResponse:
     response_model=ChatCompletionResponse,
     summary="Generate sandbox code with the OpenAI Responses API",
 )
-def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
+async def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(
@@ -944,7 +1072,8 @@ def chat_with_openai(payload: ChatRequest) -> ChatCompletionResponse:
             completion_tokens,
             total_tokens,
             raw_text,
-        ) = call_openai_responses(
+            _executed_tools,
+        ) = await call_openai_responses(
             api_key=api_key,
             system_prompt=E2B_ASSISTANT_PROMPT,
             messages=message_payload,
@@ -1527,11 +1656,11 @@ def delete_tool_file(
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 try:
-    import openpyxl
+    import openpyxl  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover
     openpyxl = None
 
 try:
-    import xlrd
+    import xlrd  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover
     xlrd = None

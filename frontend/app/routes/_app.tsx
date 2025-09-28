@@ -123,6 +123,18 @@ export default function AppLayout() {
             <span className="font-medium">E2B Sandbox</span>
           </NavLink>
 
+          <NavLink
+            to="/tool_test"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center justify-between rounded-md border border-transparent px-3 py-2 transition",
+                isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
+              )
+            }
+          >
+            <span className="font-medium">Tool Test</span>
+          </NavLink>
+
           <Separator className="my-2" />
 
           {tools.length === 0 ? (

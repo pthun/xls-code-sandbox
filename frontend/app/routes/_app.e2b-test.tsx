@@ -105,6 +105,7 @@ type SandboxApiResponse = {
   }[];
   error?: string | null;
   run_id?: string | null;
+  code_version?: number | null;
 };
 
 type RunSummary = {
@@ -232,21 +233,20 @@ function parseParamSpecsJson(text: string): ParamSpec[] {
     if (!item || typeof item !== "object") {
       throw new Error("Each param entry must be an object.");
     }
-    const name = typeof (item as Record<string, unknown>).name === "string"
-      ? (item as Record<string, unknown>).name.trim()
+    const record = item as Record<string, unknown>;
+    const name = typeof record.name === "string"
+      ? record.name.trim()
       : "";
     if (!name) {
       throw new Error("Each param requires a non-empty name.");
     }
-    const typeValue = (item as Record<string, unknown>).type;
-    const descriptionValue = (item as Record<string, unknown>).description;
+    const typeValue = record.type;
+    const descriptionValue = record.description;
     return {
       name,
       type: typeof typeValue === "string" && typeValue.trim().length > 0 ? typeValue.trim() : null,
       required:
-        typeof (item as Record<string, unknown>).required === "boolean"
-          ? (item as Record<string, unknown>).required
-          : true,
+        typeof record.required === "boolean" ? record.required : Boolean(record.required),
       description: normalizeDescription(descriptionValue) ?? null,
     } satisfies ParamSpec;
   });
@@ -270,19 +270,18 @@ function parseFileRequirementsJson(text: string): FileRequirement[] {
     if (!item || typeof item !== "object") {
       throw new Error("Each required file entry must be an object.");
     }
-    const pattern = typeof (item as Record<string, unknown>).pattern === "string"
-      ? (item as Record<string, unknown>).pattern.trim()
+    const record = item as Record<string, unknown>;
+    const pattern = typeof record.pattern === "string"
+      ? record.pattern.trim()
       : "";
     if (!pattern) {
       throw new Error("Each file requirement needs a pattern.");
     }
-    const descriptionValue = (item as Record<string, unknown>).description;
+    const descriptionValue = record.description;
     return {
       pattern,
       required:
-        typeof (item as Record<string, unknown>).required === "boolean"
-          ? (item as Record<string, unknown>).required
-          : true,
+        typeof record.required === "boolean" ? record.required : Boolean(record.required),
       description: normalizeDescription(descriptionValue) ?? null,
     } satisfies FileRequirement;
   });

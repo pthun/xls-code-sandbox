@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from contextlib import suppress
 from string import Template
-from typing import Any, Callable, Dict, Iterable, Mapping, Protocol
+from typing import Any, Callable, Dict, Iterable, Protocol
 from uuid import uuid4
 
 from e2b import CommandExitException, FileType
@@ -310,7 +310,7 @@ def _sandbox_mkdirs(sandbox: Sandbox, paths: Iterable[str]) -> None:
 
 
 def _sandbox_write_text(sandbox: Sandbox, path: str, content: str) -> None:
-    sandbox.files.write(path, content)
+    sandbox.files.write(path, content) # type: ignore[reportUnknownMemberType]
 
 
 def _sandbox_read_bytes(sandbox: Sandbox, path: str) -> bytes:
@@ -321,6 +321,20 @@ def _sandbox_read_bytes(sandbox: Sandbox, path: str) -> bytes:
 def _sandbox_delete(sandbox: Sandbox, path: str) -> None:
     with suppress(Exception):
         sandbox.files.remove(path)
+
+
+def _ping_action(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "pong": payload}
+
+
+def _enrich_customer_action(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "data": {
+            "customer_id": payload.get("customer_id"),
+            "tier": payload.get("tier", "Gold"),
+        },
+    }
 
 
 def _service_host_requests(
@@ -423,14 +437,8 @@ def execute_e2b_test(
 
     sandbox = _create_sandbox(payload.allow_internet)
     host_actions: Dict[str, HostAction] = {
-        "ping": lambda data: {"ok": True, "pong": data},
-        "enrich_customer": lambda data: {
-            "ok": True,
-            "data": {
-                "customer_id": data.get("customer_id"),
-                "tier": data.get("tier", "Gold"),
-            },
-        },
+        "ping": _ping_action,
+        "enrich_customer": _enrich_customer_action,
     }
     stdout_lines: list[str] = []
     log_lines: list[str] = []
