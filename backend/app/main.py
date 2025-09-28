@@ -18,10 +18,10 @@ from uuid import uuid4
 import dotenv
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
-from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
+from pydantic.config import ConfigDict
 from openai.types.responses import ResponseInputItemParam
 
 from .prompts.e2b_assistant import E2B_ASSISTANT_PROMPT
@@ -118,6 +118,21 @@ class ChatRequest(BaseModel):
     )
 
 
+class ChatHistoryUpdateRequest(BaseModel):
+    messages: list[StoredChatMessage] = Field(default_factory=list)
+
+
+class StoredChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = None
+    role: ChatRole
+    content: str
+    code: str | None = None
+    pipPackages: list[str] | None = None
+    kind: str | None = None
+
+
 class ChatAssistantMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: str
@@ -140,25 +155,20 @@ class ChatCompletionResponse(BaseModel):
     required_files: list[FileMetadata] = Field(default_factory=lambda: [])
 
 
-class ToolExecutionPayload(BaseModel):
-    """Captured execution details for a tool call."""
+class ToolCallResult(BaseModel):
+    """Outcome of a single tool execution."""
 
-    tool_call: dict[str, Any]
-    output: dict[str, Any]
+    success: bool
+    output: dict[str, Any] | str | None = None
+    error: str | None = None
 
 
 class ToolTestPayload(BaseModel):
-    """Serialized payload returned by the hello world tool test endpoint."""
+    """Minimal payload returned by the hello world tool test endpoint."""
 
-    tool: dict[str, Any]
     assistant_text: str
-    response: dict[str, Any]
-    usage: dict[str, Any] | None = None
     raw_text: str
-    pip_packages: list[str] = Field(default_factory=list)
-    params: list[ParamMetadata] = Field(default_factory=lambda: [])
-    required_files: list[FileMetadata] = Field(default_factory=lambda: [])
-    executions: list[ToolExecutionPayload] = Field(default_factory=lambda: [])
+    tool_result: ToolCallResult | None = None
 
 
 def _usage_from_tokens(
@@ -283,6 +293,86 @@ def _files_to_dicts(items: Sequence[FileRequirement]) -> list[FileMetadata]:
         dumped = item.model_dump()
         dictionaries.append({key: value for key, value in dumped.items()})
     return dictionaries
+
+
+def _load_chat_history(tool_id: int) -> list[StoredChatMessage]:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT payload
+            FROM e2b_chat_messages
+            WHERE tool_id = ?
+            ORDER BY order_index ASC, id ASC
+            """,
+            (tool_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    history: list[StoredChatMessage] = []
+    for row in rows:
+        payload = row["payload"]
+        if not payload:
+            continue
+        try:
+            message = StoredChatMessage.model_validate_json(payload)
+        except ValidationError:
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            try:
+                message = StoredChatMessage.model_validate(parsed)
+            except ValidationError:
+                continue
+        history.append(message)
+    return history
+
+
+def _replace_chat_history(tool_id: int, messages: Sequence[StoredChatMessage]) -> None:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.execute(
+            "DELETE FROM e2b_chat_messages WHERE tool_id = ?",
+            (tool_id,),
+        )
+        now_iso = _iso(datetime.now(timezone.utc))
+        for order, message in enumerate(messages):
+            connection.execute(
+                """
+                INSERT INTO e2b_chat_messages (
+                    tool_id,
+                    created_at,
+                    order_index,
+                    payload
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    tool_id,
+                    now_iso,
+                    order,
+                    json.dumps(message.model_dump(mode="json")),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _clear_chat_history(tool_id: int) -> None:
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.execute(
+            "DELETE FROM e2b_chat_messages WHERE tool_id = ?",
+            (tool_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _param_matches_type(value: Any, expected: str) -> bool:
@@ -848,6 +938,14 @@ def init_db() -> None:
                 local_path TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS e2b_chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id INTEGER NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                order_index INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
             """
         )
 
@@ -880,6 +978,9 @@ def init_db() -> None:
         )
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_code_versions_tool_version ON code_versions(tool_id, tool_version)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_tool ON e2b_chat_messages(tool_id, order_index)"
         )
 
         rows = connection.execute(
@@ -1043,10 +1144,9 @@ def double_number(payload: DoubleRequest) -> DoubleResponse:
     summary="Invoke the built-in hello world tool",
 )
 async def run_tool_test() -> ToolTestPayload:
-    """Execute the hello world tool and expose its Responses artefacts."""
+    """Execute a minimal Responses invocation that triggers the hello world tool."""
 
     tool = tool_registry.get("hello_world")
-    tool_definition = jsonable_encoder(tool.definition)
     api_key = os.getenv("OPENAI_API_KEY")
 
     if not api_key:
@@ -1067,12 +1167,12 @@ async def run_tool_test() -> ToolTestPayload:
 
     try:
         (
-            response,
+            _response,
             display_text,
             _code,
-            pip_packages,
-            params_model,
-            file_requirements,
+            _pip_packages,
+            _params_model,
+            _file_requirements,
             _params_present,
             _file_present,
             _prompt_tokens,
@@ -1091,26 +1191,29 @@ async def run_tool_test() -> ToolTestPayload:
         logger.exception("OpenAI tool test failed", exc_info=exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    usage_payload = jsonable_encoder(response.usage) if response.usage is not None else None
+    tool_result = None
+    if executions:
+        first_execution = executions[0]
+        parsed_output: dict[str, Any] | str | None = None
+        raw_output = first_execution.output
+        if isinstance(raw_output, str):
+            try:
+                parsed_output = json.loads(raw_output)
+            except json.JSONDecodeError:
+                parsed_output = raw_output
+        else:
+            parsed_output = raw_output
 
-    execution_details = [
-        ToolExecutionPayload(
-            tool_call=jsonable_encoder(execution),
-            output=jsonable_encoder(execution.output),
+        tool_result = ToolCallResult(
+            success=first_execution.success,
+            output=parsed_output,
+            error=first_execution.error,
         )
-        for execution in executions
-    ]
 
     return ToolTestPayload(
-        tool=tool_definition,
         assistant_text=display_text,
-        response=jsonable_encoder(response),
-        usage=usage_payload,
         raw_text=raw_text,
-        pip_packages=pip_packages,
-        params=params_model,
-        required_files=file_requirements,
-        executions=execution_details,
+        tool_result=tool_result,
     )
 
 
@@ -1246,6 +1349,39 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
         params=_params_to_dicts(target_params),
         required_files=_files_to_dicts(target_files),
     )
+
+
+@app.get(
+    "/api/tools/{tool_id}/e2b-chat/history",
+    response_model=list[StoredChatMessage],
+    summary="Load the saved chat history for a tool",
+)
+def get_chat_history(tool_id: int) -> list[StoredChatMessage]:
+    _ensure_tool_exists(tool_id)
+    return _load_chat_history(tool_id)
+
+
+@app.put(
+    "/api/tools/{tool_id}/e2b-chat/history",
+    response_model=list[StoredChatMessage],
+    summary="Replace the chat history for a tool",
+)
+def replace_chat_history(tool_id: int, payload: ChatHistoryUpdateRequest) -> list[StoredChatMessage]:
+    _ensure_tool_exists(tool_id)
+    messages = [StoredChatMessage.model_validate(message) for message in payload.messages]
+    _replace_chat_history(tool_id, messages)
+    return messages
+
+
+@app.delete(
+    "/api/tools/{tool_id}/e2b-chat/history",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Clear saved chat messages for a tool",
+)
+def clear_chat_history(tool_id: int) -> Response:
+    _ensure_tool_exists(tool_id)
+    _clear_chat_history(tool_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get(

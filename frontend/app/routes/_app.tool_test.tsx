@@ -15,21 +15,16 @@ import { API_BASE_URL } from "../config";
 import type { Route } from "./+types/_app.tool_test";
 
 
-type ToolExecution = {
-  tool_call: Record<string, unknown>;
-  output: Record<string, unknown>;
+type ToolCallResult = {
+  success: boolean;
+  output?: unknown;
+  error?: string | null;
 };
 
 type ToolInvocationPayload = {
-  tool: Record<string, unknown>;
   assistant_text: string;
-  response: Record<string, unknown>;
-  usage: Record<string, unknown> | null;
   raw_text: string;
-  pip_packages: unknown[];
-  params: Record<string, unknown>[];
-  required_files: Record<string, unknown>[];
-  executions: ToolExecution[];
+  tool_result: ToolCallResult | null;
 };
 
 type LoaderResult = {
@@ -37,6 +32,22 @@ type LoaderResult = {
   payload: ToolInvocationPayload | null;
   error?: string;
 };
+
+function formatToolOutput(output: unknown): string | null {
+  if (output === undefined || output === null) {
+    return null;
+  }
+
+  if (typeof output === "string") {
+    return output;
+  }
+
+  try {
+    return JSON.stringify(output, null, 2);
+  } catch (error) {
+    return String(output);
+  }
+}
 
 export async function loader({}: Route.LoaderArgs) {
   try {
@@ -112,6 +123,7 @@ export default function ToolTestRoute() {
   }, []);
 
   const { loading, payload, error } = state;
+  const toolOutputText = formatToolOutput(payload?.tool_result?.output);
 
   return (
     <div className="space-y-6">
@@ -150,64 +162,45 @@ export default function ToolTestRoute() {
         <div className="grid gap-4 md:grid-cols-2">
           <Card className="md:col-span-2">
             <CardHeader>
-              <CardTitle>Execution Summary</CardTitle>
-              <CardDescription>
-                {payload.executions.length} tool call
-                {payload.executions.length === 1 ? "" : "s"} captured
-              </CardDescription>
+              <CardTitle>Assistant Summary</CardTitle>
+              <CardDescription>Text returned after the tool call finished.</CardDescription>
+            </CardHeader>
+            <CardContent className="text-sm leading-relaxed">
+              {payload.assistant_text}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Tool Result</CardTitle>
+              <CardDescription>Status reported by the backend.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3 text-xs">
-              <p>
-                <span className="font-semibold">Assistant:</span> {payload.assistant_text}
-              </p>
-              {payload.usage && (
-                <pre className="rounded-md bg-muted p-3">
-                  {JSON.stringify(payload.usage, null, 2)}
-                </pre>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Tool Definition</CardTitle>
-              <CardDescription>Sent as <code>FunctionToolParam</code>.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <pre className="rounded-md bg-muted p-3 text-xs leading-relaxed">
-                {JSON.stringify(payload.tool, null, 2)}
-              </pre>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Tool Call</CardTitle>
-              <CardDescription>Matches <code>ResponseFunctionToolCallParam</code>.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {payload.executions.length > 0 ? (
-                <pre className="rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.executions[0]?.tool_call ?? null, null, 2)}
-                </pre>
+              {payload.tool_result ? (
+                <>
+                  <p>
+                    <span className="font-semibold">Status:</span>{" "}
+                    {payload.tool_result.success ? "Success" : "Failure"}
+                  </p>
+                  {payload.tool_result.error ? (
+                    <p className="text-destructive">
+                      <span className="font-semibold">Error:</span> {payload.tool_result.error}
+                    </p>
+                  ) : null}
+                  {toolOutputText ? (
+                    <pre className="rounded-md bg-muted p-3 text-xs leading-relaxed">
+                      {toolOutputText}
+                    </pre>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      No tool output returned.
+                    </p>
+                  )}
+                </>
               ) : (
-                <p className="text-xs text-muted-foreground">No tool call returned.</p>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Tool Output</CardTitle>
-              <CardDescription>Structured as <code>ResponseInputItemParam</code>.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {payload.executions.length > 0 ? (
-                <pre className="rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.executions[0]?.output ?? null, null, 2)}
-                </pre>
-              ) : (
-                <p className="text-xs text-muted-foreground">No tool output captured.</p>
+                <p className="text-xs text-muted-foreground">
+                  No tool execution recorded.
+                </p>
               )}
             </CardContent>
           </Card>
@@ -221,45 +214,6 @@ export default function ToolTestRoute() {
               <pre className="rounded-md bg-muted p-3 text-xs leading-relaxed">
                 {payload.raw_text}
               </pre>
-            </CardContent>
-          </Card>
-
-          <Card className="md:col-span-2">
-            <CardHeader>
-              <CardTitle>Response Metadata</CardTitle>
-              <CardDescription>Includes pip packages, params, and raw response object.</CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-3 md:grid-cols-2">
-              <div>
-                <h3 className="text-xs font-semibold uppercase text-muted-foreground">pip packages</h3>
-                <pre className="mt-2 rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.pip_packages, null, 2)}
-                </pre>
-              </div>
-              <div>
-                <h3 className="text-xs font-semibold uppercase text-muted-foreground">params model</h3>
-                <pre className="mt-2 rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.params, null, 2)}
-                </pre>
-              </div>
-              <div>
-                <h3 className="text-xs font-semibold uppercase text-muted-foreground">required files</h3>
-                <pre className="mt-2 rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.required_files, null, 2)}
-                </pre>
-              </div>
-              <div>
-                <h3 className="text-xs font-semibold uppercase text-muted-foreground">response object</h3>
-                <pre className="mt-2 rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.response, null, 2)}
-                </pre>
-              </div>
-              <div className="md:col-span-2">
-                <h3 className="text-xs font-semibold uppercase text-muted-foreground">executions</h3>
-                <pre className="mt-2 rounded-md bg-muted p-3 text-xs leading-relaxed">
-                  {JSON.stringify(payload.executions, null, 2)}
-                </pre>
-              </div>
             </CardContent>
           </Card>
         </div>

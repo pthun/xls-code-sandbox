@@ -176,6 +176,15 @@ function createId() {
   return Math.random().toString(36).slice(2);
 }
 
+function createInitialAssistantMessage(): ChatMessage {
+  return {
+    id: createId(),
+    role: "assistant",
+    content:
+      "Hi! Describe the tool you’d like to build. I’ll suggest Python code for the sandbox and list any pip packages I need.",
+  };
+}
+
 function formatBytes(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -394,13 +403,12 @@ function stripRunResultTags(content: string) {
 export default function CreateScriptView() {
   const { tool } = useOutletContext<ToolLayoutContextValue>();
   const toolApiBase = useMemo(() => `${API_BASE_URL}/api/tools/${tool.id}`, [tool.id]);
+  const toolChatHistoryUrl = useMemo(
+    () => `${toolApiBase}/e2b-chat/history`,
+    [toolApiBase]
+  );
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    {
-      id: createId(),
-      role: "assistant",
-      content:
-        "Hi! Describe the tool you’d like to build. I’ll suggest Python code for the sandbox and list any pip packages I need.",
-    },
+    createInitialAssistantMessage(),
   ]);
   const [input, setInput] = useState("");
   const [currentCode, setCurrentCode] = useState<string>(DEFAULT_CODE);
@@ -439,16 +447,83 @@ export default function CreateScriptView() {
 
   const [showCode, setShowCode] = useState(false);
   const [showPip, setShowPip] = useState(false);
+  const [isClearingChat, setIsClearingChat] = useState(false);
+
+  const persistChatHistory = useCallback(
+    async (entries: ChatMessage[]) => {
+      try {
+        const response = await fetch(toolChatHistoryUrl, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: entries }),
+        });
+        if (!response.ok) {
+          throw new Error(`Persist failed (${response.status})`);
+        }
+      } catch (error) {
+        console.error("Failed to persist chat history", error);
+      }
+    },
+    [toolChatHistoryUrl]
+  );
+
+  const loadChatHistory = useCallback(async () => {
+    try {
+      const response = await fetch(toolChatHistoryUrl, {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        if (response.status === 404) {
+          return;
+        }
+        throw new Error(`History load failed (${response.status})`);
+      }
+      const history = (await response.json()) as ChatMessage[];
+      if (Array.isArray(history) && history.length > 0) {
+        setMessages(history);
+      }
+    } catch (error) {
+      console.error("Failed to load chat history", error);
+    }
+  }, [toolChatHistoryUrl]);
+
+  const appendMessages = useCallback(
+    (addition: ChatMessage | ChatMessage[]) => {
+      setMessages((prev) => {
+        const additions = Array.isArray(addition) ? addition : [addition];
+        const next = [...prev, ...additions];
+        void persistChatHistory(next);
+        return next;
+      });
+    },
+    [persistChatHistory]
+  );
+
+  const handleClearChat = useCallback(async () => {
+    if (isClearingChat) {
+      return;
+    }
+    setIsClearingChat(true);
+    setChatError(null);
+    try {
+      const response = await fetch(toolChatHistoryUrl, {
+        method: "DELETE",
+      });
+      if (!response.ok && response.status !== 404) {
+        throw new Error(`Failed to clear chat (${response.status})`);
+      }
+      setMessages([createInitialAssistantMessage()]);
+    } catch (error) {
+      setChatError(
+        error instanceof Error ? error.message : "Unable to clear chat history"
+      );
+    } finally {
+      setIsClearingChat(false);
+    }
+  }, [isClearingChat, toolChatHistoryUrl]);
 
   useEffect(() => {
-    setMessages([
-      {
-        id: createId(),
-        role: "assistant",
-        content:
-          "Hi! Describe the tool you’d like to build. I’ll suggest Python code for the sandbox and list any pip packages I need.",
-      },
-    ]);
+    setMessages([createInitialAssistantMessage()]);
     setInput("");
     setChatError(null);
     setCurrentCode(DEFAULT_CODE);
@@ -478,7 +553,8 @@ export default function CreateScriptView() {
     setShowEditor(false);
     setShowCode(false);
     setShowPip(false);
-  }, [tool.id]);
+    void loadChatHistory();
+  }, [tool.id, loadChatHistory]);
 
   const combinedRunHistory = useMemo(() => {
     if (!pendingRun) {
@@ -604,7 +680,7 @@ export default function CreateScriptView() {
         content,
       };
 
-      setMessages((prev) => [...prev, newUserMessage]);
+      appendMessages(newUserMessage);
       setInput("");
       setChatError(null);
       setIsGenerating(true);
@@ -664,7 +740,7 @@ export default function CreateScriptView() {
           pipPackages: payload.pip_packages,
         };
 
-        setMessages((prev) => [...prev, assistantMessage]);
+        appendMessages(assistantMessage);
 
         if (typeof payload.code === "string" && payload.code.trim().length > 0) {
           setCurrentCode(payload.code.trim());
@@ -704,6 +780,7 @@ export default function CreateScriptView() {
       requiredFiles,
       fetchVersions,
       toolApiBase,
+      appendMessages,
     ]
   );
 
@@ -837,7 +914,7 @@ export default function CreateScriptView() {
             content: buildRunResultMessage(normalized, recentLogs),
             kind: "run-result",
           };
-          setMessages((prev) => [...prev, runMessage]);
+          appendMessages(runMessage);
           const targetRunId = normalized.runId;
           if (targetRunId) {
             void fetchRunHistory().then((history) => {
@@ -905,6 +982,7 @@ export default function CreateScriptView() {
     fetchRunHistory,
     fetchRunDetail,
     toolApiBase,
+    appendMessages,
   ]);
 
   const handleOpenEditor = useCallback(() => {
@@ -965,10 +1043,7 @@ export default function CreateScriptView() {
       setCurrentVersion(data.version.version);
       setParamSpecs(data.version.params ?? []);
       setRequiredFiles(data.version.required_files ?? []);
-      setMessages((prev) => [
-        ...prev,
-        { id: createId(), role: "user", content: data.chat_message },
-      ]);
+      appendMessages({ id: createId(), role: "user", content: data.chat_message });
       setShowEditor(false);
       await fetchVersions();
     } catch (error) {
@@ -986,6 +1061,7 @@ export default function CreateScriptView() {
     editorNote,
     fetchVersions,
     toolApiBase,
+    appendMessages,
   ]);
 
   const handleRevertVersion = useCallback(
@@ -1016,10 +1092,7 @@ export default function CreateScriptView() {
         setCurrentVersion(data.version.version);
         setParamSpecs(data.version.params ?? []);
         setRequiredFiles(data.version.required_files ?? []);
-        setMessages((prev) => [
-          ...prev,
-          { id: createId(), role: "user", content: data.chat_message },
-        ]);
+        appendMessages({ id: createId(), role: "user", content: data.chat_message });
         await fetchVersions();
       } catch (error) {
         setVersionActionError(
@@ -1029,7 +1102,7 @@ export default function CreateScriptView() {
         setIsSavingVersion(false);
       }
     },
-    [fetchVersions, toolApiBase]
+    [fetchVersions, toolApiBase, appendMessages]
   );
 
   const handleSelectRun = useCallback(
@@ -1085,11 +1158,24 @@ export default function CreateScriptView() {
         </header>
         <Card>
           <CardHeader>
-            <CardTitle>Chat with the Assistant</CardTitle>
-            <CardDescription>
-              Iterate on the sandbox script through conversation. The assistant updates the code and
-              pip requirements using structured tags.
-            </CardDescription>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <CardTitle>Chat with the Assistant</CardTitle>
+                <CardDescription>
+                  Iterate on the sandbox script through conversation. The assistant updates the code and
+                  pip requirements using structured tags.
+                </CardDescription>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleClearChat}
+                disabled={isClearingChat}
+              >
+                {isClearingChat ? "Clearing..." : "Clear chat"}
+              </Button>
+            </div>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex flex-col gap-3">
