@@ -2307,34 +2307,6 @@ def create_tool_variation_endpoint(
     record = create_variation_snapshot(tool_id, label=payload.label)
     return _variation_to_response(record)
 
-
-@app.get(
-    "/api/tools/{tool_id}/variations/{variation_id}/file",
-    summary="Download a file from a variation snapshot",
-)
-def download_variation_file(
-    tool_id: int,
-    variation_id: str,
-    path: str = Query(..., description="Relative path within the variation directory"),
-) -> FileResponse:
-    _ensure_tool_exists(tool_id)
-
-    try:
-        target = normalize_tool_path(
-            tool_id,
-            path,
-            folder_prefix=f"{VARIATION_PREFIX}/{variation_id}",
-        )
-    except VariationNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except InvalidToolFilePathError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(target)
-
 try:
     import openpyxl  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover
