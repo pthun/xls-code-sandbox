@@ -25,6 +25,7 @@ from pydantic.config import ConfigDict
 from openai.types.responses import ResponseInputItemParam
 
 from .prompts.e2b_assistant import build_e2b_assistant_prompt
+from .prompts.eval_file_generator import build_eval_file_prompt
 from .utils.e2b import (
     E2BTestRequest,
     E2BTestResponse,
@@ -163,6 +164,14 @@ class ToolCallResult(BaseModel):
     error: str | None = None
 
 
+class EvalChatCompletionResponse(BaseModel):
+    """Response payload for the eval file generation chat endpoint."""
+
+    message: ChatAssistantMessage
+    usage: ChatUsage | None = None
+    raw: str | None = None
+
+
 class ToolTestPayload(BaseModel):
     """Minimal payload returned by the hello world tool test endpoint."""
 
@@ -295,14 +304,17 @@ def _files_to_dicts(items: Sequence[FileRequirement]) -> list[FileMetadata]:
     return dictionaries
 
 
-def _load_chat_history(tool_id: int) -> list[StoredChatMessage]:
+def _load_chat_history_for_table(
+    table: str,
+    tool_id: int,
+) -> list[StoredChatMessage]:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
-            """
+            f"""
             SELECT payload
-            FROM e2b_chat_messages
+            FROM {table}
             WHERE tool_id = ?
             ORDER BY order_index ASC, id ASC
             """,
@@ -331,19 +343,31 @@ def _load_chat_history(tool_id: int) -> list[StoredChatMessage]:
     return history
 
 
-def _replace_chat_history(tool_id: int, messages: Sequence[StoredChatMessage]) -> None:
+def _load_chat_history(tool_id: int) -> list[StoredChatMessage]:
+    return _load_chat_history_for_table("e2b_chat_messages", tool_id)
+
+
+def _load_eval_chat_history(tool_id: int) -> list[StoredChatMessage]:
+    return _load_chat_history_for_table("eval_chat_messages", tool_id)
+
+
+def _replace_chat_history_for_table(
+    table: str,
+    tool_id: int,
+    messages: Sequence[StoredChatMessage],
+) -> None:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     try:
         connection.execute("PRAGMA foreign_keys = ON;")
         connection.execute(
-            "DELETE FROM e2b_chat_messages WHERE tool_id = ?",
+            f"DELETE FROM {table} WHERE tool_id = ?",
             (tool_id,),
         )
         now_iso = _iso(datetime.now(timezone.utc))
         for order, message in enumerate(messages):
             connection.execute(
-                """
-                INSERT INTO e2b_chat_messages (
+                f"""
+                INSERT INTO {table} (
                     tool_id,
                     created_at,
                     order_index,
@@ -362,17 +386,30 @@ def _replace_chat_history(tool_id: int, messages: Sequence[StoredChatMessage]) -
         connection.close()
 
 
-def _clear_chat_history(tool_id: int) -> None:
+def _replace_chat_history(tool_id: int, messages: Sequence[StoredChatMessage]) -> None:
+    _replace_chat_history_for_table("e2b_chat_messages", tool_id, messages)
+
+
+def _replace_eval_chat_history(tool_id: int, messages: Sequence[StoredChatMessage]) -> None:
+    _replace_chat_history_for_table("eval_chat_messages", tool_id, messages)
+
+
+def _clear_chat_history_for_table(table: str, tool_id: int) -> None:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     try:
         connection.execute("PRAGMA foreign_keys = ON;")
-        connection.execute(
-            "DELETE FROM e2b_chat_messages WHERE tool_id = ?",
-            (tool_id,),
-        )
+        connection.execute(f"DELETE FROM {table} WHERE tool_id = ?", (tool_id,))
         connection.commit()
     finally:
         connection.close()
+
+
+def _clear_chat_history(tool_id: int) -> None:
+    _clear_chat_history_for_table("e2b_chat_messages", tool_id)
+
+
+def _clear_eval_chat_history(tool_id: int) -> None:
+    _clear_chat_history_for_table("eval_chat_messages", tool_id)
 
 
 def _param_matches_type(value: Any, expected: str) -> bool:
@@ -946,6 +983,14 @@ def init_db() -> None:
                 order_index INTEGER NOT NULL,
                 payload TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS eval_chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id INTEGER NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                order_index INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
             """
         )
 
@@ -981,6 +1026,9 @@ def init_db() -> None:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_tool ON e2b_chat_messages(tool_id, order_index)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_chat_messages_tool ON eval_chat_messages(tool_id, order_index)"
         )
 
         rows = connection.execute(
@@ -1359,6 +1407,79 @@ async def chat_with_openai(tool_id: int, payload: ChatRequest) -> ChatCompletion
     )
 
 
+@app.post(
+    "/api/tools/{tool_id}/eval-chat",
+    response_model=EvalChatCompletionResponse,
+    summary="Generate evaluation file variations with the OpenAI Responses API",
+)
+async def chat_generate_eval_files(
+    tool_id: int, payload: ChatRequest
+) -> EvalChatCompletionResponse:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not configured on the server",
+        )
+
+    _ensure_tool_exists(tool_id)
+    model_name = payload.model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+    message_payload: list[ResponseInputItemParam] = []
+    for message in payload.messages:
+        content = message.content.strip()
+        if not content:
+            continue
+        message_payload.append({"role": message.role, "content": content})
+
+    available_tools = list(tool_registry.values())
+    tool_descriptors = [_tool_descriptor(tool) for tool in available_tools]
+    tool_names = [tool.name for tool in available_tools]
+    system_prompt = build_eval_file_prompt(tool_descriptors)
+
+    try:
+        (
+            _response,
+            display_text,
+            _code_snippet,
+            _pip_packages,
+            _params_payload,
+            _file_payload,
+            _params_present,
+            _files_present,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            raw_text,
+            _executed_tools,
+        ) = await call_openai_responses(
+            tool_id=tool_id,
+            api_key=api_key,
+            system_prompt=system_prompt,
+            messages=message_payload,
+            model_name=model_name,
+            tool_names=tool_names,
+            parse_structured_tags=False,
+        )
+    except Exception as exc:  # pragma: no cover - network interaction
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    final_text = display_text.strip()
+    if not final_text and raw_text:
+        final_text = raw_text.strip()
+    if not final_text:
+        final_text = "I wasn't able to produce a response."
+
+    assistant_message = ChatAssistantMessage(content=final_text)
+    usage = _usage_from_tokens(prompt_tokens, completion_tokens, total_tokens)
+
+    return EvalChatCompletionResponse(
+        message=assistant_message,
+        usage=usage,
+        raw=raw_text,
+    )
+
+
 @app.get(
     "/api/tools/{tool_id}/e2b-chat/history",
     response_model=list[StoredChatMessage],
@@ -1389,6 +1510,41 @@ def replace_chat_history(tool_id: int, payload: ChatHistoryUpdateRequest) -> lis
 def clear_chat_history(tool_id: int) -> Response:
     _ensure_tool_exists(tool_id)
     _clear_chat_history(tool_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get(
+    "/api/tools/{tool_id}/eval-chat/history",
+    response_model=list[StoredChatMessage],
+    summary="Load the saved eval chat history for a tool",
+)
+def get_eval_chat_history(tool_id: int) -> list[StoredChatMessage]:
+    _ensure_tool_exists(tool_id)
+    return _load_eval_chat_history(tool_id)
+
+
+@app.put(
+    "/api/tools/{tool_id}/eval-chat/history",
+    response_model=list[StoredChatMessage],
+    summary="Replace the eval chat history for a tool",
+)
+def replace_eval_chat_history(
+    tool_id: int, payload: ChatHistoryUpdateRequest
+) -> list[StoredChatMessage]:
+    _ensure_tool_exists(tool_id)
+    messages = [StoredChatMessage.model_validate(message) for message in payload.messages]
+    _replace_eval_chat_history(tool_id, messages)
+    return messages
+
+
+@app.delete(
+    "/api/tools/{tool_id}/eval-chat/history",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Clear saved eval chat messages for a tool",
+)
+def clear_eval_chat_history(tool_id: int) -> Response:
+    _ensure_tool_exists(tool_id)
+    _clear_eval_chat_history(tool_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

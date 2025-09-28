@@ -140,6 +140,7 @@ def resolve_tool_file(
 
     normalized_path: Path | None = None
     stored_filename: str | None = None
+    base_dir = (UPLOAD_ROOT / str(tool_id)).resolve()
 
     with db_connection() as connection:
         ensure_tool_exists(connection, tool_id)
@@ -154,15 +155,46 @@ def resolve_tool_file(
             ).fetchone()
         else:
             normalized_path = normalize_tool_path(tool_id, path)
-            stored_filename = normalized_path.name
+            candidate_name = normalized_path.name
+            # Primary lookup: stored filename on disk.
             row = connection.execute(
                 """
                 SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
                 FROM tool_files
                 WHERE tool_id = ? AND stored_filename = ?
                 """,
-                (tool_id, stored_filename),
+                (tool_id, candidate_name),
             ).fetchone()
+
+            if row is None:
+                # Secondary lookup: original filename as uploaded by the user.
+                row = connection.execute(
+                    """
+                    SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
+                    FROM tool_files
+                    WHERE tool_id = ? AND original_filename = ?
+                    ORDER BY uploaded_at DESC
+                    LIMIT 1
+                    """,
+                    (tool_id, candidate_name),
+                ).fetchone()
+
+            if row is None:
+                # Final attempt: treat the provided path as already relative to the tool directory.
+                try:
+                    relative_candidate = normalized_path.relative_to(base_dir)
+                except ValueError:  # pragma: no cover - should not happen after normalize
+                    relative_candidate = None
+
+                if relative_candidate is not None and str(relative_candidate) != candidate_name:
+                    row = connection.execute(
+                        """
+                        SELECT id, tool_id, original_filename, stored_filename, content_type, size_bytes, uploaded_at
+                        FROM tool_files
+                        WHERE tool_id = ? AND stored_filename = ?
+                        """,
+                        (tool_id, str(relative_candidate)),
+                    ).fetchone()
 
     if row is None:
         if file_id is None:
@@ -173,7 +205,6 @@ def resolve_tool_file(
         raise ToolFileNotFoundError(msg)
 
     stored_filename = row["stored_filename"]
-    base_dir = (UPLOAD_ROOT / str(tool_id)).resolve()
     file_path = (base_dir / stored_filename).resolve()
     return ToolFileRecord(
         id=int(row["id"]),

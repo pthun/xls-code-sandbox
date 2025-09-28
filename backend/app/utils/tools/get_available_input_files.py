@@ -23,9 +23,16 @@ class AvailableInputFile(BaseModel):
     id: int
     path: str = Field(description="Absolute path to the stored file on disk.")
     relative_path: str = Field(
-        description="Path to the file relative to the uploads root.")
+        description=(
+            "Path within the tool directory (pass this as 'path' when calling other tools)."
+        )
+    )
     original_filename: str
-    stored_filename: str
+    stored_filename: str = Field(
+        description=(
+            "Internal filename; identical to relative_path and guaranteed unique for the tool."
+        )
+    )
     size_bytes: int
     content_type: str | None
     uploaded_at: str
@@ -53,8 +60,7 @@ GET_AVAILABLE_INPUT_FILES_DEFINITION = FunctionToolParam(
 
 
 def _build_file_payload(record: ToolFileRecord) -> AvailableInputFile:
-    base = UPLOAD_ROOT.resolve()
-    relative_path = record.path.relative_to(base) if record.path.is_relative_to(base) else record.stored_filename
+    relative_path = record.stored_filename
     return AvailableInputFile(
         id=record.id,
         path=str(record.path),

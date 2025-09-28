@@ -201,6 +201,19 @@ export default function ToolLayout() {
             >
               Create script
             </NavLink>
+            <NavLink
+              to="generate-eval-files"
+              className={({ isActive }) =>
+                cn(
+                  "block rounded-md px-3 py-2 text-sm transition",
+                  isActive
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent/40"
+                )
+              }
+            >
+              Generate eval files
+            </NavLink>
           </nav>
         </div>
 

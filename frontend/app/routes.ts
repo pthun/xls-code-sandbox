@@ -8,6 +8,10 @@ export default [
       index("routes/_app.tools.$toolId.tsx"),
       route("files", "routes/_app.tools.$toolId.files.tsx"),
       route("script", "routes/_app.tools.$toolId.script.tsx"),
+      route(
+        "generate-eval-files",
+        "routes/_app.tools.$toolId.generate-eval-files.tsx"
+      ),
     ]),
   ]),
 ] satisfies RouteConfig;
