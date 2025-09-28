@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from typing import Mapping, Optional, Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from openai.types.responses import FunctionToolParam
 
 from .base import ResponseTool, ToolExecutionResult
@@ -25,23 +25,10 @@ MAX_SAMPLE_ROWS = 5
 class CsvFileArgs(BaseModel):
     """Arguments accepted by the get_shape_summary tool."""
 
-    path: str | None = Field(
-        default=None,
-        description="Absolute or relative path to the CSV file inside the uploads directory.",
+    path: str = Field(
+        ...,
+        description="Path (relative to the tool uploads directory) to the CSV file.",
     )
-    file_id: int | None = Field(
-        default=None,
-        ge=1,
-        description="Identifier of the uploaded file (alternative to path).",
-    )
-
-    @model_validator(mode="after")
-    def validate_locator(self) -> "CsvFileArgs":
-        if (self.path is None and self.file_id is None) or (
-            self.path is not None and self.file_id is not None
-        ):
-            raise ValueError("Provide exactly one of 'path' or 'file_id'.")
-        return self
 
 
 class CsvSampleRow(BaseModel):
@@ -130,7 +117,6 @@ async def _execute_get_shape_summary(
     try:
         record = resolve_tool_file(
             tool_id,
-            file_id=args.file_id,
             path=args.path,
         )
     except ToolNotFoundError as exc:

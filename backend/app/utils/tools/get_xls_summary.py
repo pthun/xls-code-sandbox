@@ -6,7 +6,7 @@ import math
 from datetime import date, datetime
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from openai.types.responses import FunctionToolParam
 
 from .base import ResponseTool, ToolExecutionResult
@@ -36,23 +36,10 @@ MAX_SAMPLE_ROWS = 5
 class SpreadsheetFileArgs(BaseModel):
     """Arguments accepted by the get_xls_summary tool."""
 
-    path: str | None = Field(
-        default=None,
-        description="Absolute or relative path to the spreadsheet inside the uploads directory.",
+    path: str = Field(
+        ...,
+        description="Path (relative to the tool uploads directory) to the spreadsheet.",
     )
-    file_id: int | None = Field(
-        default=None,
-        ge=1,
-        description="Identifier of the uploaded file (alternative to path).",
-    )
-
-    @model_validator(mode="after")
-    def validate_locator(self) -> "SpreadsheetFileArgs":
-        if (self.path is None and self.file_id is None) or (
-            self.path is not None and self.file_id is not None
-        ):
-            raise ValueError("Provide exactly one of 'path' or 'file_id'.")
-        return self
 
 
 class WorksheetSampleRow(BaseModel):
@@ -264,7 +251,6 @@ async def _execute_get_xls_summary(
     try:
         record = resolve_tool_file(
             tool_id,
-            file_id=args.file_id,
             path=args.path,
         )
     except (ToolNotFoundError, ToolFileNotFoundError, InvalidToolFilePathError) as exc:
