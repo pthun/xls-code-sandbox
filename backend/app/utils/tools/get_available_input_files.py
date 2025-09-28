@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from openai.types.responses import FunctionToolParam
 
 from .base import ResponseTool, ToolExecutionResult
-from .filesystem import ToolFileRecord, ToolNotFoundError, UPLOAD_ROOT, list_tool_files
+from .filesystem import ToolFileRecord, ToolNotFoundError, list_tool_files
 from .registry import registry
 
 
@@ -18,25 +18,14 @@ class GetAvailableInputFilesArgs(BaseModel):
     pass
 
 class AvailableInputFile(BaseModel):
-    """Metadata about an uploaded input file."""
+    """Minimal metadata describing an uploaded input file."""
 
-    id: int
-    path: str = Field(description="Absolute path to the stored file on disk.")
-    relative_path: str = Field(
+    filename: str = Field(description="Human-readable name of the uploaded file.")
+    path: str = Field(
         description=(
-            "Path within the tool directory (pass this as 'path' when calling other tools)."
+            "Path to use when referencing the file within this tool's uploads directory."
         )
     )
-    original_filename: str
-    stored_filename: str = Field(
-        description=(
-            "Internal filename; identical to relative_path and guaranteed unique for the tool."
-        )
-    )
-    size_bytes: int
-    content_type: str | None
-    uploaded_at: str
-    exists: bool
 
 
 class GetAvailableInputFilesResult(BaseModel):
@@ -60,17 +49,10 @@ GET_AVAILABLE_INPUT_FILES_DEFINITION = FunctionToolParam(
 
 
 def _build_file_payload(record: ToolFileRecord) -> AvailableInputFile:
-    relative_path = record.stored_filename
+    human_path = record.original_filename
     return AvailableInputFile(
-        id=record.id,
-        path=str(record.path),
-        relative_path=str(relative_path),
-        original_filename=record.original_filename,
-        stored_filename=record.stored_filename,
-        size_bytes=record.size_bytes,
-        content_type=record.content_type,
-        uploaded_at=record.uploaded_at.isoformat(),
-        exists=record.exists,
+        filename=record.original_filename,
+        path=human_path,
     )
 
 
