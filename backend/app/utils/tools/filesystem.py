@@ -173,6 +173,8 @@ def create_variation_snapshot(tool_id: int, *, label: str | None = None) -> Vari
                 stored_filename=record.stored_filename,
                 size_bytes=record.size_bytes,
                 uploaded_at=record.uploaded_at,
+                relative_path=record.stored_filename,
+                content_type=None,
             )
         )
 

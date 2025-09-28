@@ -58,6 +58,7 @@ from .utils.tools.filesystem import (
     normalize_folder_prefix,
     normalize_tool_path,
     resolve_storage_root,
+    resolve_tool_file,
 )
 from .utils.misc.typeguards import is_any_list
 
@@ -2251,6 +2252,38 @@ def delete_tool_file(
 
 
 @app.get(
+    "/api/tools/{tool_id}/files/download",
+    response_class=FileResponse,
+    summary="Download a file from the specified workspace",
+)
+def download_tool_file(
+    tool_id: int,
+    path: str = Query(..., description="Path to the file inside the selected workspace"),
+    folder_prefix: str | None = Query(
+        default=None,
+        description="Workspace prefix (e.g. 'uploads' or 'variation/0001').",
+    ),
+    connection: sqlite3.Connection = Depends(get_db),
+) -> FileResponse:
+    tool_exists = connection.execute(
+        "SELECT 1 FROM tools WHERE id = ?",
+        (tool_id,),
+    ).fetchone()
+    if tool_exists is None:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    try:
+        record = resolve_tool_file(tool_id, path=path, folder_prefix=folder_prefix)
+    except InvalidToolFilePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ToolFileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    filename = record.original_filename or Path(path).name
+    return FileResponse(record.path, filename=filename)
+
+
+@app.get(
     "/api/tools/{tool_id}/variations",
     response_model=list[VariationResponse],
     summary="List variation workspaces for a tool",
@@ -2273,6 +2306,34 @@ def create_tool_variation_endpoint(
     _ensure_tool_exists(tool_id)
     record = create_variation_snapshot(tool_id, label=payload.label)
     return _variation_to_response(record)
+
+
+@app.get(
+    "/api/tools/{tool_id}/variations/{variation_id}/file",
+    summary="Download a file from a variation snapshot",
+)
+def download_variation_file(
+    tool_id: int,
+    variation_id: str,
+    path: str = Query(..., description="Relative path within the variation directory"),
+) -> FileResponse:
+    _ensure_tool_exists(tool_id)
+
+    try:
+        target = normalize_tool_path(
+            tool_id,
+            path,
+            folder_prefix=f"{VARIATION_PREFIX}/{variation_id}",
+        )
+    except VariationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidToolFilePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(target)
 
 try:
     import openpyxl  # type: ignore[import]

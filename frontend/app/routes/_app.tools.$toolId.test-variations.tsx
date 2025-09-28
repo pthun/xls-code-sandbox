@@ -775,29 +775,44 @@ export default function TestVariationsView() {
                   </p>
                 ) : (
                   <ul className="space-y-2 text-sm">
-                    {selectedVariation.files.map((file) => (
-                      <li
-                        key={file.path}
-                        className="rounded-md border border-border bg-muted/20 px-3 py-2"
-                      >
-                        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                          <span className="font-medium text-foreground">
-                            {file.path}
-                          </span>
-                          <span>{formatBytes(file.size_bytes)}</span>
-                        </div>
-                        {file.filename && file.filename !== file.path && (
-                          <p className="mt-1 text-[11px] text-muted-foreground">
-                            Original name: {file.filename}
-                          </p>
-                        )}
-                        {file.modified_at && (
-                          <p className="mt-1 text-[11px] text-muted-foreground">
-                            Saved {formatDateTime(file.modified_at)}
-                          </p>
-                        )}
-                      </li>
-                    ))}
+                    {selectedVariation.files.map((file) => {
+                      const downloadUrl = `${API_BASE_URL}/api/tools/${tool.id}/variations/${selectedVariation.id}/file?path=${encodeURIComponent(file.relative_path)}`;
+                      return (
+                        <li
+                          key={file.relative_path}
+                          className="rounded-md border border-border bg-muted/20 px-3 py-2"
+                        >
+                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                            <span className="flex-1 truncate font-medium text-foreground">
+                              {file.relative_path}
+                            </span>
+                            <div className="flex items-center gap-2">
+                              <span>{formatBytes(file.size_bytes)}</span>
+                              <Button
+                                asChild
+                                size="icon"
+                                variant="ghost"
+                                title={`Download ${file.relative_path}`}
+                              >
+                                <a href={downloadUrl} target="_blank" rel="noreferrer" download>
+                                  <Download className="size-4" />
+                                </a>
+                              </Button>
+                            </div>
+                          </div>
+                          {file.original_filename && file.original_filename !== file.relative_path && (
+                            <p className="mt-1 text-[11px] text-muted-foreground">
+                              Original name: {file.original_filename}
+                            </p>
+                          )}
+                          {file.uploaded_at && (
+                            <p className="mt-1 text-[11px] text-muted-foreground">
+                              Saved {formatDateTime(file.uploaded_at)}
+                            </p>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </CardContent>

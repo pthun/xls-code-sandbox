@@ -5,7 +5,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import { Loader2, Send, Trash2 } from "lucide-react";
+import { Download, Loader2, Send, Trash2 } from "lucide-react";
 import { useOutletContext } from "react-router";
 
 import { Button } from "~/components/ui/button";
@@ -62,6 +62,17 @@ type Variation = {
 
 const DEFAULT_FOLDER_PREFIX = "uploads";
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1
+  );
+  const value = bytes / 1024 ** exponent;
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[exponent]}`;
+}
+
 function createId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -100,6 +111,12 @@ export default function GenerateEvalFilesView() {
     return activeVariation.label?.trim() || `Variation ${activeVariation.id}`;
   }, [activeVariation]);
   const isVariationWorkspace = folderPrefix !== DEFAULT_FOLDER_PREFIX;
+  const currentFiles = useMemo(() => {
+    if (isVariationWorkspace) {
+      return activeVariation?.files ?? [];
+    }
+    return tool.files;
+  }, [isVariationWorkspace, activeVariation, tool.files]);
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     createInitialAssistantMessage(),
@@ -425,6 +442,64 @@ export default function GenerateEvalFilesView() {
             )}
           </Button>
         </CardFooter>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Workspace files</CardTitle>
+          <CardDescription>
+            These files will be available to the assistant while working in the selected workspace.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {currentFiles.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              {isVariationWorkspace
+                ? "This variation does not contain any files yet."
+                : "No files uploaded yet. Add sample files from the Manage files page."}
+            </p>
+          ) : (
+            <ul className="space-y-2 text-sm">
+              {currentFiles.map((file) => (
+                <li
+                  key={`${file.path}-${file.modified_at}`}
+                  className="rounded-md border border-border bg-muted/20 px-3 py-2"
+                >
+                  <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground" title={file.path}>
+                      {file.path}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <span>{formatBytes(file.size_bytes)}</span>
+                      <Button
+                        asChild
+                        size="icon"
+                        variant="ghost"
+                        title={`Download ${file.filename}`}
+                      >
+                        <a
+                          href={`${toolApiBase}/files/download?path=${encodeURIComponent(
+                            file.path
+                          )}${
+                            isVariationWorkspace
+                              ? `&folder_prefix=${encodeURIComponent(folderPrefix)}`
+                              : ""
+                          }`}
+                          download
+                        >
+                          <Download className="size-4" />
+                        </a>
+                      </Button>
+                    </div>
+                  </div>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Updated {new Date(file.modified_at).toLocaleString()}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardContent>
       </Card>
 
       <Card>
